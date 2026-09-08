@@ -2,12 +2,8 @@ module github.com/costfluent/k8s-agent
 
 go 1.23.0
 
-replace github.com/costfluent/costfluent-go => ../costfluent-go
-
 require (
-	github.com/costfluent/costfluent-go v0.0.0
 	github.com/prometheus/client_golang v1.20.5
-	github.com/prometheus/common v0.61.0
 	github.com/spf13/viper v1.19.0
 	go.uber.org/zap v1.27.0
 	k8s.io/api v0.32.0
@@ -46,6 +42,7 @@ require (
 	github.com/pelletier/go-toml/v2 v2.2.2 // indirect
 	github.com/pkg/errors v0.9.1 // indirect
 	github.com/prometheus/client_model v0.6.1 // indirect
+	github.com/prometheus/common v0.61.0 // indirect
 	github.com/prometheus/procfs v0.15.1 // indirect
 	github.com/sagikazarmark/locafero v0.4.0 // indirect
 	github.com/sagikazarmark/slog-shim v0.1.0 // indirect

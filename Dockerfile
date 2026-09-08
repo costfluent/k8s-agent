@@ -1,9 +1,15 @@
-# Build stage
-FROM golang:1.23-alpine AS builder
+# Build stage.
+#
+# Pinned to the build host's own platform and cross-compiled with Go rather than emulated: buildx
+# sets TARGETOS/TARGETARCH per requested platform, and a CGO-free Go build cross-compiles natively.
+# Emulating the compiler under QEMU for arm64 would be minutes slower for an identical binary.
+FROM --platform=$BUILDPLATFORM golang:1.23-alpine AS builder
 
 ARG VERSION=dev
 ARG GIT_COMMIT=unknown
 ARG BUILD_TIME
+ARG TARGETOS
+ARG TARGETARCH
 
 WORKDIR /app
 
@@ -18,7 +24,7 @@ RUN go mod download
 COPY . .
 
 # Build
-RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build \
+RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH:-amd64} go build \
     -ldflags="-w -s -X main.Version=${VERSION} -X main.GitCommit=${GIT_COMMIT} -X main.BuildTime=${BUILD_TIME}" \
     -o /costfluent-agent \
     ./cmd/agent
