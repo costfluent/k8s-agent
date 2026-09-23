@@ -1,141 +1,240 @@
+// Package config reads the agent's configuration from COSTFLUENT_* environment variables.
 package config
 
 import (
+	"errors"
 	"fmt"
+	"net/url"
 	"os"
+	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
-	"github.com/spf13/viper"
+	corev1 "k8s.io/api/core/v1"
 )
 
-// Config holds all agent configuration
-type Config struct {
-	// Required
-	Token       string `mapstructure:"token"`
-	ClusterID   string `mapstructure:"cluster_id"`
-	ClusterName string `mapstructure:"cluster_name"`
+const (
+	DefaultAPIEndpoint      = "https://api.costfluent.com"
+	DefaultDataDir          = "/data"
+	DefaultMetricsPort      = 9010
+	DefaultPollingInterval  = 60 * time.Second
+	MaxAllowedAnnotations   = 10
+	MaxAnnotationValueChars = 100
+)
 
-	// API endpoint
-	APIEndpoint string `mapstructure:"api_endpoint"`
-
-	// Intervals
-	PollingInterval   time.Duration `mapstructure:"polling_interval"`
-	ReportingInterval time.Duration `mapstructure:"reporting_interval"`
-	HeartbeatInterval time.Duration `mapstructure:"heartbeat_interval"`
-
-	// Filtering
-	NamespaceInclude []string `mapstructure:"namespace_include"`
-	NamespaceExclude []string `mapstructure:"namespace_exclude"`
-
-	// Metadata collection
-	CollectAnnotations     bool     `mapstructure:"collect_annotations"`
-	AllowedAnnotations     []string `mapstructure:"allowed_annotations"`
-	MaxAnnotations         int      `mapstructure:"max_annotations"`
-	MaxAnnotationLength    int      `mapstructure:"max_annotation_length"`
-	CollectNamespaceLabels bool     `mapstructure:"collect_namespace_labels"`
-
-	// Storage
-	DataDir string `mapstructure:"data_dir"`
-
-	// Metrics server
-	MetricsEnabled bool `mapstructure:"metrics_enabled"`
-	MetricsPort    int  `mapstructure:"metrics_port"`
-
-	// Logging
-	LogLevel  string `mapstructure:"log_level"`
-	LogFormat string `mapstructure:"log_format"`
+// DefaultNodeAddressTypes is the order a node's addresses are tried in to reach its kubelet.
+var DefaultNodeAddressTypes = []corev1.NodeAddressType{
+	corev1.NodeInternalIP,
+	corev1.NodeInternalDNS,
+	corev1.NodeHostName,
+	corev1.NodeExternalIP,
+	corev1.NodeExternalDNS,
 }
 
-// Load reads configuration from environment and file
-func Load() (*Config, error) {
-	v := viper.New()
-
-	// Defaults
-	v.SetDefault("api_endpoint", "https://api.costfluent.com")
-	v.SetDefault("polling_interval", 60*time.Second)
-	v.SetDefault("reporting_interval", 3600*time.Second)
-	v.SetDefault("heartbeat_interval", 300*time.Second)
-	v.SetDefault("namespace_exclude", []string{"kube-system", "kube-public"})
-	// Opt-in: annotations often carry internal configuration, and this agent runs in someone
-	// else's cluster. A customer who allocates cost by annotation names the prefixes they want
-	// in allowed_annotations; nobody ships annotation values by accident.
-	v.SetDefault("collect_annotations", false)
-	v.SetDefault("max_annotations", 10)
-	v.SetDefault("max_annotation_length", 100)
-	v.SetDefault("collect_namespace_labels", true)
-	v.SetDefault("data_dir", "/data")
-	v.SetDefault("metrics_enabled", true)
-	v.SetDefault("metrics_port", 9010)
-	v.SetDefault("log_level", "info")
-	v.SetDefault("log_format", "json")
-
-	// Environment variables
-	v.SetEnvPrefix("COSTFLUENT")
-	v.SetEnvKeyReplacer(strings.NewReplacer(".", "_", "-", "_"))
-	v.AutomaticEnv()
-
-	// Config file (optional)
-	configPath := os.Getenv("COSTFLUENT_CONFIG_PATH")
-	if configPath == "" {
-		configPath = "/etc/costfluent"
+var (
+	clusterIDPattern  = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$`)
+	pollingIntervals  = []int{5, 10, 15, 30, 60}
+	knownAddressTypes = map[string]corev1.NodeAddressType{
+		string(corev1.NodeHostName):    corev1.NodeHostName,
+		string(corev1.NodeInternalIP):  corev1.NodeInternalIP,
+		string(corev1.NodeInternalDNS): corev1.NodeInternalDNS,
+		string(corev1.NodeExternalIP):  corev1.NodeExternalIP,
+		string(corev1.NodeExternalDNS): corev1.NodeExternalDNS,
 	}
-	v.SetConfigName("config")
-	v.SetConfigType("yaml")
-	v.AddConfigPath(configPath)
-	v.AddConfigPath(".")
+)
 
-	if err := v.ReadInConfig(); err != nil {
-		if _, ok := err.(viper.ConfigFileNotFoundError); !ok {
-			return nil, fmt.Errorf("reading config: %w", err)
+// Config is the complete agent configuration.
+type Config struct {
+	Token                  string
+	ClusterID              string
+	APIEndpoint            *url.URL
+	PollingInterval        time.Duration
+	NodeAddressTypes       []corev1.NodeAddressType
+	KubeSkipTLSVerify      bool
+	AllowedLabels          []string
+	AllowedAnnotations     []string
+	CollectNamespaceLabels bool
+	ReportHTTPProxy        *url.URL
+	DataDir                string
+	MetricsPort            int
+	LogLevel               string
+	LogFormat              string
+
+	// Warnings are non-fatal findings the caller logs once a logger exists.
+	Warnings []string
+}
+
+// Load reads the configuration from the process environment.
+func Load() (*Config, error) {
+	return load(os.LookupEnv)
+}
+
+func load(lookup func(string) (string, bool)) (*Config, error) {
+	get := func(key string) string {
+		v, _ := lookup(key)
+		return strings.TrimSpace(v)
+	}
+
+	var errs []error
+	cfg := &Config{
+		Token:     get("COSTFLUENT_TOKEN"),
+		ClusterID: get("COSTFLUENT_CLUSTER_ID"),
+		DataDir:   orDefault(get("COSTFLUENT_DATA_DIR"), DefaultDataDir),
+		LogLevel:  orDefault(get("COSTFLUENT_LOG_LEVEL"), "info"),
+		LogFormat: orDefault(get("COSTFLUENT_LOG_FORMAT"), "json"),
+	}
+
+	if cfg.Token == "" {
+		errs = append(errs, errors.New("COSTFLUENT_TOKEN is required: set agent.token or agent.secret.name in the chart"))
+	}
+	if cfg.ClusterID == "" {
+		errs = append(errs, errors.New("COSTFLUENT_CLUSTER_ID is required: set agent.clusterID in the chart"))
+	} else if !clusterIDPattern.MatchString(cfg.ClusterID) {
+		errs = append(errs, fmt.Errorf("COSTFLUENT_CLUSTER_ID %q must match %s", cfg.ClusterID, clusterIDPattern))
+	}
+
+	endpoint, warning, err := parseEndpoint(orDefault(get("COSTFLUENT_API_ENDPOINT"), DefaultAPIEndpoint))
+	if err != nil {
+		errs = append(errs, err)
+	}
+	cfg.APIEndpoint = endpoint
+	if warning != "" {
+		cfg.Warnings = append(cfg.Warnings, warning)
+	}
+
+	cfg.PollingInterval = DefaultPollingInterval
+	if raw := get("COSTFLUENT_POLLING_INTERVAL"); raw != "" {
+		seconds, err := strconv.Atoi(raw)
+		if err != nil || !contains(pollingIntervals, seconds) {
+			errs = append(errs, fmt.Errorf("COSTFLUENT_POLLING_INTERVAL %q must be one of 5, 10, 15, 30 or 60 seconds", raw))
+		} else {
+			cfg.PollingInterval = time.Duration(seconds) * time.Second
 		}
 	}
 
-	var cfg Config
-	if err := v.Unmarshal(&cfg); err != nil {
-		return nil, fmt.Errorf("unmarshaling config: %w", err)
+	cfg.NodeAddressTypes = DefaultNodeAddressTypes
+	if raw := get("COSTFLUENT_NODE_ADDRESS_TYPES"); raw != "" {
+		types, err := parseAddressTypes(raw)
+		if err != nil {
+			errs = append(errs, err)
+		} else {
+			cfg.NodeAddressTypes = types
+		}
 	}
 
-	if err := cfg.Validate(); err != nil {
+	if cfg.KubeSkipTLSVerify, err = parseBool("COSTFLUENT_KUBE_SKIP_TLS_VERIFY", get("COSTFLUENT_KUBE_SKIP_TLS_VERIFY")); err != nil {
+		errs = append(errs, err)
+	}
+	if cfg.CollectNamespaceLabels, err = parseBool("COSTFLUENT_COLLECT_NAMESPACE_LABELS", get("COSTFLUENT_COLLECT_NAMESPACE_LABELS")); err != nil {
+		errs = append(errs, err)
+	}
+
+	cfg.AllowedLabels = splitList(get("COSTFLUENT_ALLOWED_LABELS"))
+	cfg.AllowedAnnotations = splitList(get("COSTFLUENT_ALLOWED_ANNOTATIONS"))
+	if len(cfg.AllowedAnnotations) > MaxAllowedAnnotations {
+		errs = append(errs, fmt.Errorf("COSTFLUENT_ALLOWED_ANNOTATIONS names %d keys; at most %d are allowed", len(cfg.AllowedAnnotations), MaxAllowedAnnotations))
+	}
+
+	if raw := get("COSTFLUENT_REPORT_HTTP_PROXY"); raw != "" {
+		proxy, err := url.Parse(raw)
+		if err != nil || proxy.Host == "" || (proxy.Scheme != "http" && proxy.Scheme != "https") {
+			errs = append(errs, fmt.Errorf("COSTFLUENT_REPORT_HTTP_PROXY %q must be an http:// or https:// URL", raw))
+		} else {
+			cfg.ReportHTTPProxy = proxy
+		}
+	}
+
+	cfg.MetricsPort = DefaultMetricsPort
+	if raw := get("COSTFLUENT_METRICS_PORT"); raw != "" {
+		port, err := strconv.Atoi(raw)
+		if err != nil || port < 1 || port > 65535 {
+			errs = append(errs, fmt.Errorf("COSTFLUENT_METRICS_PORT %q must be a port number", raw))
+		} else {
+			cfg.MetricsPort = port
+		}
+	}
+
+	switch cfg.LogLevel {
+	case "debug", "info", "warn", "error":
+	default:
+		errs = append(errs, fmt.Errorf("COSTFLUENT_LOG_LEVEL %q must be debug, info, warn or error", cfg.LogLevel))
+	}
+	switch cfg.LogFormat {
+	case "json", "console":
+	default:
+		errs = append(errs, fmt.Errorf("COSTFLUENT_LOG_FORMAT %q must be json or console", cfg.LogFormat))
+	}
+
+	if err := errors.Join(errs...); err != nil {
 		return nil, err
 	}
-
-	return &cfg, nil
+	return cfg, nil
 }
 
-// Validate checks required fields
-func (c *Config) Validate() error {
-	if c.Token == "" {
-		return fmt.Errorf("token is required (set COSTFLUENT_TOKEN)")
+func parseEndpoint(raw string) (*url.URL, string, error) {
+	u, err := url.Parse(strings.TrimRight(raw, "/"))
+	if err != nil || u.Host == "" {
+		return nil, "", fmt.Errorf("COSTFLUENT_API_ENDPOINT %q must be an absolute URL", raw)
 	}
-	if c.ClusterID == "" {
-		return fmt.Errorf("cluster_id is required (set COSTFLUENT_CLUSTER_ID)")
+	switch u.Scheme {
+	case "https":
+		return u, "", nil
+	case "http":
+		return u, fmt.Sprintf("COSTFLUENT_API_ENDPOINT %s is plain http: the token and reports are sent unencrypted", u), nil
+	default:
+		return nil, "", fmt.Errorf("COSTFLUENT_API_ENDPOINT %q must use https:// (or http:// for a local receiver)", raw)
 	}
-	if c.PollingInterval < 5*time.Second {
-		return fmt.Errorf("polling_interval must be >= 5s")
-	}
-	if c.ReportingInterval < 60*time.Second {
-		return fmt.Errorf("reporting_interval must be >= 60s")
-	}
-	return nil
 }
 
-// ShouldCollectNamespace returns true if namespace should be collected
-func (c *Config) ShouldCollectNamespace(ns string) bool {
-	// Check exclusions first
-	for _, excluded := range c.NamespaceExclude {
-		if excluded == ns {
-			return false
+func parseAddressTypes(raw string) ([]corev1.NodeAddressType, error) {
+	var types []corev1.NodeAddressType
+	for _, name := range splitList(raw) {
+		t, ok := knownAddressTypes[name]
+		if !ok {
+			return nil, fmt.Errorf("COSTFLUENT_NODE_ADDRESS_TYPES: unknown address type %q (use Hostname, InternalDNS, InternalIP, ExternalDNS, ExternalIP)", name)
+		}
+		types = append(types, t)
+	}
+	if len(types) == 0 {
+		return nil, errors.New("COSTFLUENT_NODE_ADDRESS_TYPES names no address type")
+	}
+	return types, nil
+}
+
+func parseBool(key, raw string) (bool, error) {
+	if raw == "" {
+		return false, nil
+	}
+	v, err := strconv.ParseBool(raw)
+	if err != nil {
+		return false, fmt.Errorf("%s %q must be true or false", key, raw)
+	}
+	return v, nil
+}
+
+func splitList(raw string) []string {
+	var out []string
+	for _, part := range strings.Split(raw, ",") {
+		if part = strings.TrimSpace(part); part != "" {
+			out = append(out, part)
 		}
 	}
-	// If inclusions specified, namespace must be in list
-	if len(c.NamespaceInclude) > 0 {
-		for _, included := range c.NamespaceInclude {
-			if included == ns {
-				return true
-			}
-		}
-		return false
+	return out
+}
+
+func orDefault(v, fallback string) string {
+	if v == "" {
+		return fallback
 	}
-	return true
+	return v
+}
+
+func contains(values []int, v int) bool {
+	for _, candidate := range values {
+		if candidate == v {
+			return true
+		}
+	}
+	return false
 }

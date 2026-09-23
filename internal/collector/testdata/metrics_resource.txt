@@ -1,0 +1,301 @@
+# HELP container_cpu_usage_seconds_total [STABLE] Cumulative cpu time consumed by the container in core-seconds
+# TYPE container_cpu_usage_seconds_total counter
+container_cpu_usage_seconds_total{container="ceph-crash",namespace="rook-ceph",pod="rook-ceph-crashcollector-dev-cluster-worker-1-84cbb76465-5h6lg"} 0.175665 1790148986919
+container_cpu_usage_seconds_total{container="ceph-exporter",namespace="rook-ceph",pod="rook-ceph-exporter-dev-cluster-worker-1-6d66995554-8g59k"} 28.626569 1790148988481
+container_cpu_usage_seconds_total{container="cert-manager-webhook",namespace="cert-manager",pod="cert-manager-webhook-646c95c5ff-kcd75"} 2.532502 1790148982126
+container_cpu_usage_seconds_total{container="cloudflare-tunnel",namespace="cloudflare-tunnel",pod="cloudflare-tunnel-7cfdcf8fcd-hcmnc"} 14.404972 1790148982614
+container_cpu_usage_seconds_total{container="controller",namespace="tailscale-ingress-nginx",pod="tailscale-ingress-nginx-controller-547db955c8-9fpx2"} 35.377974 1790148984969
+container_cpu_usage_seconds_total{container="csi-attacher",namespace="rook-ceph",pod="rook-ceph.cephfs.csi.ceph.com-ctrlplugin-59d877c-xnms5"} 3.633739 1790148988436
+container_cpu_usage_seconds_total{container="csi-attacher",namespace="rook-ceph",pod="rook-ceph.rbd.csi.ceph.com-ctrlplugin-b9dc56dd4-s7s4g"} 4.071687 1790148990238
+container_cpu_usage_seconds_total{container="csi-cephfsplugin",namespace="rook-ceph",pod="rook-ceph.cephfs.csi.ceph.com-ctrlplugin-59d877c-xnms5"} 0.315271 1790148976167
+container_cpu_usage_seconds_total{container="csi-cephfsplugin",namespace="rook-ceph",pod="rook-ceph.cephfs.csi.ceph.com-nodeplugin-g2gc8"} 0.392858 1790148991389
+container_cpu_usage_seconds_total{container="csi-provisioner",namespace="rook-ceph",pod="rook-ceph.cephfs.csi.ceph.com-ctrlplugin-59d877c-xnms5"} 13.233585 1790148988818
+container_cpu_usage_seconds_total{container="csi-provisioner",namespace="rook-ceph",pod="rook-ceph.rbd.csi.ceph.com-ctrlplugin-b9dc56dd4-s7s4g"} 14.06878 1790148989300
+container_cpu_usage_seconds_total{container="csi-rbdplugin",namespace="rook-ceph",pod="rook-ceph.rbd.csi.ceph.com-ctrlplugin-b9dc56dd4-s7s4g"} 0.37556 1790148983496
+container_cpu_usage_seconds_total{container="csi-rbdplugin",namespace="rook-ceph",pod="rook-ceph.rbd.csi.ceph.com-nodeplugin-9d8gm"} 0.755094 1790148984775
+container_cpu_usage_seconds_total{container="csi-resizer",namespace="rook-ceph",pod="rook-ceph.cephfs.csi.ceph.com-ctrlplugin-59d877c-xnms5"} 12.219931 1790148979205
+container_cpu_usage_seconds_total{container="csi-resizer",namespace="rook-ceph",pod="rook-ceph.rbd.csi.ceph.com-ctrlplugin-b9dc56dd4-s7s4g"} 15.759716 1790148984693
+container_cpu_usage_seconds_total{container="csi-snapshotter",namespace="rook-ceph",pod="rook-ceph.cephfs.csi.ceph.com-ctrlplugin-59d877c-xnms5"} 3.221456 1790148985845
+container_cpu_usage_seconds_total{container="csi-snapshotter",namespace="rook-ceph",pod="rook-ceph.rbd.csi.ceph.com-ctrlplugin-b9dc56dd4-s7s4g"} 3.048988 1790148986318
+container_cpu_usage_seconds_total{container="driver-registrar",namespace="rook-ceph",pod="rook-ceph.cephfs.csi.ceph.com-nodeplugin-g2gc8"} 0.329098 1790148982597
+container_cpu_usage_seconds_total{container="driver-registrar",namespace="rook-ceph",pod="rook-ceph.rbd.csi.ceph.com-nodeplugin-9d8gm"} 0.332244 1790148979865
+container_cpu_usage_seconds_total{container="kube-flannel",namespace="kube-system",pod="kube-flannel-g585n"} 0.848119 1790148981393
+container_cpu_usage_seconds_total{container="kube-proxy",namespace="kube-system",pod="kube-proxy-f5h6w"} 1.545405 1790148978221
+container_cpu_usage_seconds_total{container="local-path-provisioner",namespace="local-path-storage",pod="local-path-provisioner-54745b98cf-hdj89"} 4.853519 1790148987816
+container_cpu_usage_seconds_total{container="log-collector",namespace="rook-ceph",pod="rook-ceph-exporter-dev-cluster-worker-1-6d66995554-8g59k"} 0.078446 1790148987120
+container_cpu_usage_seconds_total{container="log-collector",namespace="rook-ceph",pod="rook-ceph-mds-ceph-filesystem-a-7b6785cbdf-czghw"} 0.079705 1790148990763
+container_cpu_usage_seconds_total{container="log-collector",namespace="rook-ceph",pod="rook-ceph-mgr-b-6c7cf686df-4754t"} 0.080429 1790148976235
+container_cpu_usage_seconds_total{container="log-collector",namespace="rook-ceph",pod="rook-ceph-mon-b-7c7cc8f655-5h4lt"} 0.086149 1790148987605
+container_cpu_usage_seconds_total{container="log-collector",namespace="rook-ceph",pod="rook-ceph-osd-0-79b577b686-cc5kr"} 0.094012 1790148967262
+container_cpu_usage_seconds_total{container="log-collector",namespace="rook-ceph",pod="rook-ceph-rgw-ceph-objectstore-a-8f7d755df-xms42"} 0.078547 1790148975970
+container_cpu_usage_seconds_total{container="log-rotator",namespace="rook-ceph",pod="rook-ceph.cephfs.csi.ceph.com-ctrlplugin-59d877c-xnms5"} 0.08071 1790148971494
+container_cpu_usage_seconds_total{container="log-rotator",namespace="rook-ceph",pod="rook-ceph.cephfs.csi.ceph.com-nodeplugin-g2gc8"} 0.093051 1790148987189
+container_cpu_usage_seconds_total{container="log-rotator",namespace="rook-ceph",pod="rook-ceph.rbd.csi.ceph.com-ctrlplugin-b9dc56dd4-s7s4g"} 0.131565 1790148977117
+container_cpu_usage_seconds_total{container="log-rotator",namespace="rook-ceph",pod="rook-ceph.rbd.csi.ceph.com-nodeplugin-9d8gm"} 0.085298 1790148977592
+container_cpu_usage_seconds_total{container="manager",namespace="rook-ceph",pod="ceph-csi-controller-manager-5fffdd447b-hcw68"} 2.939262 1790148987000
+container_cpu_usage_seconds_total{container="mds",namespace="rook-ceph",pod="rook-ceph-mds-ceph-filesystem-a-7b6785cbdf-czghw"} 93.06361 1790148983653
+container_cpu_usage_seconds_total{container="mgr",namespace="rook-ceph",pod="rook-ceph-mgr-b-6c7cf686df-4754t"} 117.307252 1790148979376
+container_cpu_usage_seconds_total{container="mon",namespace="rook-ceph",pod="rook-ceph-mon-b-7c7cc8f655-5h4lt"} 148.235651 1790148978769
+container_cpu_usage_seconds_total{container="osd",namespace="rook-ceph",pod="rook-ceph-osd-0-79b577b686-cc5kr"} 123.20202 1790148983264
+container_cpu_usage_seconds_total{container="rgw",namespace="rook-ceph",pod="rook-ceph-rgw-ceph-objectstore-a-8f7d755df-xms42"} 76.156016 1790148983475
+container_cpu_usage_seconds_total{container="rke2-snapshot-controller",namespace="kube-system",pod="snapshot-controller-rke2-snapshot-controller-54f665d4bd-5xnr6"} 5.942503 1790148974460
+container_cpu_usage_seconds_total{container="rook-ceph-operator",namespace="rook-ceph",pod="rook-ceph-operator-bdd664cb7-sq596"} 242.11824 1790148979566
+container_cpu_usage_seconds_total{container="test-tailscale-ingress-nginx",namespace="test-tailscale-ingress-nginx",pod="test-tailscale-ingress-nginx-bc8f84d5-nnw4t"} 0.079552 1790148987717
+container_cpu_usage_seconds_total{container="watch-active",namespace="rook-ceph",pod="rook-ceph-mgr-b-6c7cf686df-4754t"} 115.504189 1790148979304
+# HELP container_memory_working_set_bytes [STABLE] Current working set of the container in bytes
+# TYPE container_memory_working_set_bytes gauge
+container_memory_working_set_bytes{container="ceph-crash",namespace="rook-ceph",pod="rook-ceph-crashcollector-dev-cluster-worker-1-84cbb76465-5h6lg"} 7.14752e+06 1790148986919
+container_memory_working_set_bytes{container="ceph-exporter",namespace="rook-ceph",pod="rook-ceph-exporter-dev-cluster-worker-1-6d66995554-8g59k"} 1.5716352e+07 1790148988481
+container_memory_working_set_bytes{container="cert-manager-webhook",namespace="cert-manager",pod="cert-manager-webhook-646c95c5ff-kcd75"} 5.871616e+07 1790148982126
+container_memory_working_set_bytes{container="cloudflare-tunnel",namespace="cloudflare-tunnel",pod="cloudflare-tunnel-7cfdcf8fcd-hcmnc"} 1.6564224e+07 1790148982614
+container_memory_working_set_bytes{container="controller",namespace="tailscale-ingress-nginx",pod="tailscale-ingress-nginx-controller-547db955c8-9fpx2"} 1.73821952e+08 1790148984969
+container_memory_working_set_bytes{container="csi-attacher",namespace="rook-ceph",pod="rook-ceph.cephfs.csi.ceph.com-ctrlplugin-59d877c-xnms5"} 1.1358208e+07 1790148988436
+container_memory_working_set_bytes{container="csi-attacher",namespace="rook-ceph",pod="rook-ceph.rbd.csi.ceph.com-ctrlplugin-b9dc56dd4-s7s4g"} 6.2251008e+07 1790148990238
+container_memory_working_set_bytes{container="csi-cephfsplugin",namespace="rook-ceph",pod="rook-ceph.cephfs.csi.ceph.com-ctrlplugin-59d877c-xnms5"} 1.8546688e+07 1790148976167
+container_memory_working_set_bytes{container="csi-cephfsplugin",namespace="rook-ceph",pod="rook-ceph.cephfs.csi.ceph.com-nodeplugin-g2gc8"} 1.880064e+07 1790148991389
+container_memory_working_set_bytes{container="csi-provisioner",namespace="rook-ceph",pod="rook-ceph.cephfs.csi.ceph.com-ctrlplugin-59d877c-xnms5"} 1.3713408e+07 1790148988818
+container_memory_working_set_bytes{container="csi-provisioner",namespace="rook-ceph",pod="rook-ceph.rbd.csi.ceph.com-ctrlplugin-b9dc56dd4-s7s4g"} 6.5880064e+07 1790148989300
+container_memory_working_set_bytes{container="csi-rbdplugin",namespace="rook-ceph",pod="rook-ceph.rbd.csi.ceph.com-ctrlplugin-b9dc56dd4-s7s4g"} 1.8223104e+07 1790148983496
+container_memory_working_set_bytes{container="csi-rbdplugin",namespace="rook-ceph",pod="rook-ceph.rbd.csi.ceph.com-nodeplugin-9d8gm"} 2.228224e+07 1790148984775
+container_memory_working_set_bytes{container="csi-resizer",namespace="rook-ceph",pod="rook-ceph.cephfs.csi.ceph.com-ctrlplugin-59d877c-xnms5"} 1.1231232e+07 1790148979205
+container_memory_working_set_bytes{container="csi-resizer",namespace="rook-ceph",pod="rook-ceph.rbd.csi.ceph.com-ctrlplugin-b9dc56dd4-s7s4g"} 6.0997632e+07 1790148984693
+container_memory_working_set_bytes{container="csi-snapshotter",namespace="rook-ceph",pod="rook-ceph.cephfs.csi.ceph.com-ctrlplugin-59d877c-xnms5"} 1.2201984e+07 1790148985845
+container_memory_working_set_bytes{container="csi-snapshotter",namespace="rook-ceph",pod="rook-ceph.rbd.csi.ceph.com-ctrlplugin-b9dc56dd4-s7s4g"} 5.851136e+07 1790148986318
+container_memory_working_set_bytes{container="driver-registrar",namespace="rook-ceph",pod="rook-ceph.cephfs.csi.ceph.com-nodeplugin-g2gc8"} 1.2603392e+07 1790148982597
+container_memory_working_set_bytes{container="driver-registrar",namespace="rook-ceph",pod="rook-ceph.rbd.csi.ceph.com-nodeplugin-9d8gm"} 1.4553088e+07 1790148979865
+container_memory_working_set_bytes{container="kube-flannel",namespace="kube-system",pod="kube-flannel-g585n"} 5.4812672e+07 1790148981393
+container_memory_working_set_bytes{container="kube-proxy",namespace="kube-system",pod="kube-proxy-f5h6w"} 6.1407232e+07 1790148978221
+container_memory_working_set_bytes{container="local-path-provisioner",namespace="local-path-storage",pod="local-path-provisioner-54745b98cf-hdj89"} 5.0221056e+07 1790148987816
+container_memory_working_set_bytes{container="log-collector",namespace="rook-ceph",pod="rook-ceph-exporter-dev-cluster-worker-1-6d66995554-8g59k"} 1.277952e+06 1790148987120
+container_memory_working_set_bytes{container="log-collector",namespace="rook-ceph",pod="rook-ceph-mds-ceph-filesystem-a-7b6785cbdf-czghw"} 888832 1790148990763
+container_memory_working_set_bytes{container="log-collector",namespace="rook-ceph",pod="rook-ceph-mgr-b-6c7cf686df-4754t"} 897024 1790148976235
+container_memory_working_set_bytes{container="log-collector",namespace="rook-ceph",pod="rook-ceph-mon-b-7c7cc8f655-5h4lt"} 901120 1790148987605
+container_memory_working_set_bytes{container="log-collector",namespace="rook-ceph",pod="rook-ceph-osd-0-79b577b686-cc5kr"} 888832 1790148967262
+container_memory_working_set_bytes{container="log-collector",namespace="rook-ceph",pod="rook-ceph-rgw-ceph-objectstore-a-8f7d755df-xms42"} 897024 1790148975970
+container_memory_working_set_bytes{container="log-rotator",namespace="rook-ceph",pod="rook-ceph.cephfs.csi.ceph.com-ctrlplugin-59d877c-xnms5"} 876544 1790148971494
+container_memory_working_set_bytes{container="log-rotator",namespace="rook-ceph",pod="rook-ceph.cephfs.csi.ceph.com-nodeplugin-g2gc8"} 2.576384e+06 1790148987189
+container_memory_working_set_bytes{container="log-rotator",namespace="rook-ceph",pod="rook-ceph.rbd.csi.ceph.com-ctrlplugin-b9dc56dd4-s7s4g"} 868352 1790148977117
+container_memory_working_set_bytes{container="log-rotator",namespace="rook-ceph",pod="rook-ceph.rbd.csi.ceph.com-nodeplugin-9d8gm"} 2.322432e+06 1790148977592
+container_memory_working_set_bytes{container="manager",namespace="rook-ceph",pod="ceph-csi-controller-manager-5fffdd447b-hcw68"} 1.615872e+07 1790148987000
+container_memory_working_set_bytes{container="mds",namespace="rook-ceph",pod="rook-ceph-mds-ceph-filesystem-a-7b6785cbdf-czghw"} 3.5442688e+07 1790148983653
+container_memory_working_set_bytes{container="mgr",namespace="rook-ceph",pod="rook-ceph-mgr-b-6c7cf686df-4754t"} 2.5024512e+08 1790148979376
+container_memory_working_set_bytes{container="mon",namespace="rook-ceph",pod="rook-ceph-mon-b-7c7cc8f655-5h4lt"} 1.40570624e+08 1790148978769
+container_memory_working_set_bytes{container="osd",namespace="rook-ceph",pod="rook-ceph-osd-0-79b577b686-cc5kr"} 2.55389696e+08 1790148983264
+container_memory_working_set_bytes{container="rgw",namespace="rook-ceph",pod="rook-ceph-rgw-ceph-objectstore-a-8f7d755df-xms42"} 1.61349632e+08 1790148983475
+container_memory_working_set_bytes{container="rke2-snapshot-controller",namespace="kube-system",pod="snapshot-controller-rke2-snapshot-controller-54f665d4bd-5xnr6"} 6.475776e+07 1790148974460
+container_memory_working_set_bytes{container="rook-ceph-operator",namespace="rook-ceph",pod="rook-ceph-operator-bdd664cb7-sq596"} 8.3099648e+07 1790148979566
+container_memory_working_set_bytes{container="test-tailscale-ingress-nginx",namespace="test-tailscale-ingress-nginx",pod="test-tailscale-ingress-nginx-bc8f84d5-nnw4t"} 1.9795968e+07 1790148987717
+container_memory_working_set_bytes{container="watch-active",namespace="rook-ceph",pod="rook-ceph-mgr-b-6c7cf686df-4754t"} 6.1448192e+07 1790148979304
+# HELP container_start_time_seconds [STABLE] Start time of the container since unix epoch in seconds
+# TYPE container_start_time_seconds gauge
+container_start_time_seconds{container="ceph-crash",namespace="rook-ceph",pod="rook-ceph-crashcollector-dev-cluster-worker-1-84cbb76465-5h6lg"} 1.7901443052602258e+09
+container_start_time_seconds{container="ceph-exporter",namespace="rook-ceph",pod="rook-ceph-exporter-dev-cluster-worker-1-6d66995554-8g59k"} 1.7901443042387276e+09
+container_start_time_seconds{container="cert-manager-webhook",namespace="cert-manager",pod="cert-manager-webhook-646c95c5ff-kcd75"} 1.790144303264362e+09
+container_start_time_seconds{container="cloudflare-tunnel",namespace="cloudflare-tunnel",pod="cloudflare-tunnel-7cfdcf8fcd-hcmnc"} 1.7901443445425599e+09
+container_start_time_seconds{container="controller",namespace="tailscale-ingress-nginx",pod="tailscale-ingress-nginx-controller-547db955c8-9fpx2"} 1.790144303104688e+09
+container_start_time_seconds{container="csi-attacher",namespace="rook-ceph",pod="rook-ceph.cephfs.csi.ceph.com-ctrlplugin-59d877c-xnms5"} 1.7901443153587058e+09
+container_start_time_seconds{container="csi-attacher",namespace="rook-ceph",pod="rook-ceph.rbd.csi.ceph.com-ctrlplugin-b9dc56dd4-s7s4g"} 1.7901443124660745e+09
+container_start_time_seconds{container="csi-cephfsplugin",namespace="rook-ceph",pod="rook-ceph.cephfs.csi.ceph.com-ctrlplugin-59d877c-xnms5"} 1.7901443150847337e+09
+container_start_time_seconds{container="csi-cephfsplugin",namespace="rook-ceph",pod="rook-ceph.cephfs.csi.ceph.com-nodeplugin-g2gc8"} 1.7901443149651177e+09
+container_start_time_seconds{container="csi-provisioner",namespace="rook-ceph",pod="rook-ceph.cephfs.csi.ceph.com-ctrlplugin-59d877c-xnms5"} 1.7901443151776931e+09
+container_start_time_seconds{container="csi-provisioner",namespace="rook-ceph",pod="rook-ceph.rbd.csi.ceph.com-ctrlplugin-b9dc56dd4-s7s4g"} 1.7901443122858377e+09
+container_start_time_seconds{container="csi-rbdplugin",namespace="rook-ceph",pod="rook-ceph.rbd.csi.ceph.com-ctrlplugin-b9dc56dd4-s7s4g"} 1.7901443121938362e+09
+container_start_time_seconds{container="csi-rbdplugin",namespace="rook-ceph",pod="rook-ceph.rbd.csi.ceph.com-nodeplugin-9d8gm"} 1.7901443109788544e+09
+container_start_time_seconds{container="csi-resizer",namespace="rook-ceph",pod="rook-ceph.cephfs.csi.ceph.com-ctrlplugin-59d877c-xnms5"} 1.790144315274168e+09
+container_start_time_seconds{container="csi-resizer",namespace="rook-ceph",pod="rook-ceph.rbd.csi.ceph.com-ctrlplugin-b9dc56dd4-s7s4g"} 1.790144312377003e+09
+container_start_time_seconds{container="csi-snapshotter",namespace="rook-ceph",pod="rook-ceph.cephfs.csi.ceph.com-ctrlplugin-59d877c-xnms5"} 1.7901443154819925e+09
+container_start_time_seconds{container="csi-snapshotter",namespace="rook-ceph",pod="rook-ceph.rbd.csi.ceph.com-ctrlplugin-b9dc56dd4-s7s4g"} 1.7901443125844707e+09
+container_start_time_seconds{container="driver-registrar",namespace="rook-ceph",pod="rook-ceph.cephfs.csi.ceph.com-nodeplugin-g2gc8"} 1.790144299398217e+09
+container_start_time_seconds{container="driver-registrar",namespace="rook-ceph",pod="rook-ceph.rbd.csi.ceph.com-nodeplugin-9d8gm"} 1.790144299402257e+09
+container_start_time_seconds{container="kube-flannel",namespace="kube-system",pod="kube-flannel-g585n"} 1.7901443001134787e+09
+container_start_time_seconds{container="kube-proxy",namespace="kube-system",pod="kube-proxy-f5h6w"} 1.790144299318821e+09
+container_start_time_seconds{container="local-path-provisioner",namespace="local-path-storage",pod="local-path-provisioner-54745b98cf-hdj89"} 1.790144303256428e+09
+container_start_time_seconds{container="log-collector",namespace="rook-ceph",pod="rook-ceph-exporter-dev-cluster-worker-1-6d66995554-8g59k"} 1.790144304357391e+09
+container_start_time_seconds{container="log-collector",namespace="rook-ceph",pod="rook-ceph-mds-ceph-filesystem-a-7b6785cbdf-czghw"} 1.7901443043590431e+09
+container_start_time_seconds{container="log-collector",namespace="rook-ceph",pod="rook-ceph-mgr-b-6c7cf686df-4754t"} 1.7901443044690895e+09
+container_start_time_seconds{container="log-collector",namespace="rook-ceph",pod="rook-ceph-mon-b-7c7cc8f655-5h4lt"} 1.7901443053696723e+09
+container_start_time_seconds{container="log-collector",namespace="rook-ceph",pod="rook-ceph-osd-0-79b577b686-cc5kr"} 1.7901443596303656e+09
+container_start_time_seconds{container="log-collector",namespace="rook-ceph",pod="rook-ceph-rgw-ceph-objectstore-a-8f7d755df-xms42"} 1.7901443043818076e+09
+container_start_time_seconds{container="log-rotator",namespace="rook-ceph",pod="rook-ceph.cephfs.csi.ceph.com-ctrlplugin-59d877c-xnms5"} 1.7901443155748236e+09
+container_start_time_seconds{container="log-rotator",namespace="rook-ceph",pod="rook-ceph.cephfs.csi.ceph.com-nodeplugin-g2gc8"} 1.790144299505906e+09
+container_start_time_seconds{container="log-rotator",namespace="rook-ceph",pod="rook-ceph.rbd.csi.ceph.com-ctrlplugin-b9dc56dd4-s7s4g"} 1.7901443126924357e+09
+container_start_time_seconds{container="log-rotator",namespace="rook-ceph",pod="rook-ceph.rbd.csi.ceph.com-nodeplugin-9d8gm"} 1.7901442995046012e+09
+container_start_time_seconds{container="manager",namespace="rook-ceph",pod="ceph-csi-controller-manager-5fffdd447b-hcw68"} 1.7901483671455443e+09
+container_start_time_seconds{container="mds",namespace="rook-ceph",pod="rook-ceph-mds-ceph-filesystem-a-7b6785cbdf-czghw"} 1.7901443042485907e+09
+container_start_time_seconds{container="mgr",namespace="rook-ceph",pod="rook-ceph-mgr-b-6c7cf686df-4754t"} 1.7901443042588336e+09
+container_start_time_seconds{container="mon",namespace="rook-ceph",pod="rook-ceph-mon-b-7c7cc8f655-5h4lt"} 1.7901443052670262e+09
+container_start_time_seconds{container="osd",namespace="rook-ceph",pod="rook-ceph-osd-0-79b577b686-cc5kr"} 1.7901443595552716e+09
+container_start_time_seconds{container="rgw",namespace="rook-ceph",pod="rook-ceph-rgw-ceph-objectstore-a-8f7d755df-xms42"} 1.7901443042434385e+09
+container_start_time_seconds{container="rke2-snapshot-controller",namespace="kube-system",pod="snapshot-controller-rke2-snapshot-controller-54f665d4bd-5xnr6"} 1.7901443170735683e+09
+container_start_time_seconds{container="rook-ceph-operator",namespace="rook-ceph",pod="rook-ceph-operator-bdd664cb7-sq596"} 1.7901443160607398e+09
+container_start_time_seconds{container="test-tailscale-ingress-nginx",namespace="test-tailscale-ingress-nginx",pod="test-tailscale-ingress-nginx-bc8f84d5-nnw4t"} 1.7901443038994703e+09
+container_start_time_seconds{container="watch-active",namespace="rook-ceph",pod="rook-ceph-mgr-b-6c7cf686df-4754t"} 1.7901443043765166e+09
+# HELP container_swap_limit_bytes [ALPHA] Current amount of the container swap limit in bytes. Reported only on non-windows systems
+# TYPE container_swap_limit_bytes gauge
+container_swap_limit_bytes{container="ceph-crash",namespace="rook-ceph",pod="rook-ceph-crashcollector-dev-cluster-worker-1-84cbb76465-5h6lg"} 0 1790148986919
+container_swap_limit_bytes{container="ceph-exporter",namespace="rook-ceph",pod="rook-ceph-exporter-dev-cluster-worker-1-6d66995554-8g59k"} 0 1790148988481
+container_swap_limit_bytes{container="cert-manager-webhook",namespace="cert-manager",pod="cert-manager-webhook-646c95c5ff-kcd75"} 0 1790148982126
+container_swap_limit_bytes{container="cloudflare-tunnel",namespace="cloudflare-tunnel",pod="cloudflare-tunnel-7cfdcf8fcd-hcmnc"} 0 1790148982614
+container_swap_limit_bytes{container="controller",namespace="tailscale-ingress-nginx",pod="tailscale-ingress-nginx-controller-547db955c8-9fpx2"} 0 1790148984969
+container_swap_limit_bytes{container="csi-attacher",namespace="rook-ceph",pod="rook-ceph.cephfs.csi.ceph.com-ctrlplugin-59d877c-xnms5"} 0 1790148988436
+container_swap_limit_bytes{container="csi-attacher",namespace="rook-ceph",pod="rook-ceph.rbd.csi.ceph.com-ctrlplugin-b9dc56dd4-s7s4g"} 0 1790148990238
+container_swap_limit_bytes{container="csi-cephfsplugin",namespace="rook-ceph",pod="rook-ceph.cephfs.csi.ceph.com-ctrlplugin-59d877c-xnms5"} 0 1790148976167
+container_swap_limit_bytes{container="csi-cephfsplugin",namespace="rook-ceph",pod="rook-ceph.cephfs.csi.ceph.com-nodeplugin-g2gc8"} 0 1790148991389
+container_swap_limit_bytes{container="csi-provisioner",namespace="rook-ceph",pod="rook-ceph.cephfs.csi.ceph.com-ctrlplugin-59d877c-xnms5"} 0 1790148988818
+container_swap_limit_bytes{container="csi-provisioner",namespace="rook-ceph",pod="rook-ceph.rbd.csi.ceph.com-ctrlplugin-b9dc56dd4-s7s4g"} 0 1790148989300
+container_swap_limit_bytes{container="csi-rbdplugin",namespace="rook-ceph",pod="rook-ceph.rbd.csi.ceph.com-ctrlplugin-b9dc56dd4-s7s4g"} 0 1790148983496
+container_swap_limit_bytes{container="csi-rbdplugin",namespace="rook-ceph",pod="rook-ceph.rbd.csi.ceph.com-nodeplugin-9d8gm"} 0 1790148984775
+container_swap_limit_bytes{container="csi-resizer",namespace="rook-ceph",pod="rook-ceph.cephfs.csi.ceph.com-ctrlplugin-59d877c-xnms5"} 0 1790148979205
+container_swap_limit_bytes{container="csi-resizer",namespace="rook-ceph",pod="rook-ceph.rbd.csi.ceph.com-ctrlplugin-b9dc56dd4-s7s4g"} 0 1790148984693
+container_swap_limit_bytes{container="csi-snapshotter",namespace="rook-ceph",pod="rook-ceph.cephfs.csi.ceph.com-ctrlplugin-59d877c-xnms5"} 0 1790148985845
+container_swap_limit_bytes{container="csi-snapshotter",namespace="rook-ceph",pod="rook-ceph.rbd.csi.ceph.com-ctrlplugin-b9dc56dd4-s7s4g"} 0 1790148986318
+container_swap_limit_bytes{container="driver-registrar",namespace="rook-ceph",pod="rook-ceph.cephfs.csi.ceph.com-nodeplugin-g2gc8"} 0 1790148982597
+container_swap_limit_bytes{container="driver-registrar",namespace="rook-ceph",pod="rook-ceph.rbd.csi.ceph.com-nodeplugin-9d8gm"} 0 1790148979865
+container_swap_limit_bytes{container="kube-flannel",namespace="kube-system",pod="kube-flannel-g585n"} 0 1790148981393
+container_swap_limit_bytes{container="kube-proxy",namespace="kube-system",pod="kube-proxy-f5h6w"} 0 1790148978221
+container_swap_limit_bytes{container="local-path-provisioner",namespace="local-path-storage",pod="local-path-provisioner-54745b98cf-hdj89"} 0 1790148987816
+container_swap_limit_bytes{container="log-collector",namespace="rook-ceph",pod="rook-ceph-exporter-dev-cluster-worker-1-6d66995554-8g59k"} 0 1790148987120
+container_swap_limit_bytes{container="log-collector",namespace="rook-ceph",pod="rook-ceph-mds-ceph-filesystem-a-7b6785cbdf-czghw"} 0 1790148990763
+container_swap_limit_bytes{container="log-collector",namespace="rook-ceph",pod="rook-ceph-mgr-b-6c7cf686df-4754t"} 0 1790148976235
+container_swap_limit_bytes{container="log-collector",namespace="rook-ceph",pod="rook-ceph-mon-b-7c7cc8f655-5h4lt"} 0 1790148987605
+container_swap_limit_bytes{container="log-collector",namespace="rook-ceph",pod="rook-ceph-osd-0-79b577b686-cc5kr"} 0 1790148967262
+container_swap_limit_bytes{container="log-collector",namespace="rook-ceph",pod="rook-ceph-rgw-ceph-objectstore-a-8f7d755df-xms42"} 0 1790148975970
+container_swap_limit_bytes{container="log-rotator",namespace="rook-ceph",pod="rook-ceph.cephfs.csi.ceph.com-ctrlplugin-59d877c-xnms5"} 0 1790148971494
+container_swap_limit_bytes{container="log-rotator",namespace="rook-ceph",pod="rook-ceph.cephfs.csi.ceph.com-nodeplugin-g2gc8"} 0 1790148987189
+container_swap_limit_bytes{container="log-rotator",namespace="rook-ceph",pod="rook-ceph.rbd.csi.ceph.com-ctrlplugin-b9dc56dd4-s7s4g"} 0 1790148977117
+container_swap_limit_bytes{container="log-rotator",namespace="rook-ceph",pod="rook-ceph.rbd.csi.ceph.com-nodeplugin-9d8gm"} 0 1790148977592
+container_swap_limit_bytes{container="manager",namespace="rook-ceph",pod="ceph-csi-controller-manager-5fffdd447b-hcw68"} 0 1790148987000
+container_swap_limit_bytes{container="mds",namespace="rook-ceph",pod="rook-ceph-mds-ceph-filesystem-a-7b6785cbdf-czghw"} 0 1790148983653
+container_swap_limit_bytes{container="mgr",namespace="rook-ceph",pod="rook-ceph-mgr-b-6c7cf686df-4754t"} 0 1790148979376
+container_swap_limit_bytes{container="mon",namespace="rook-ceph",pod="rook-ceph-mon-b-7c7cc8f655-5h4lt"} 0 1790148978769
+container_swap_limit_bytes{container="osd",namespace="rook-ceph",pod="rook-ceph-osd-0-79b577b686-cc5kr"} 0 1790148983264
+container_swap_limit_bytes{container="rgw",namespace="rook-ceph",pod="rook-ceph-rgw-ceph-objectstore-a-8f7d755df-xms42"} 0 1790148983475
+container_swap_limit_bytes{container="rke2-snapshot-controller",namespace="kube-system",pod="snapshot-controller-rke2-snapshot-controller-54f665d4bd-5xnr6"} 0 1790148974460
+container_swap_limit_bytes{container="rook-ceph-operator",namespace="rook-ceph",pod="rook-ceph-operator-bdd664cb7-sq596"} 0 1790148979566
+container_swap_limit_bytes{container="test-tailscale-ingress-nginx",namespace="test-tailscale-ingress-nginx",pod="test-tailscale-ingress-nginx-bc8f84d5-nnw4t"} 0 1790148987717
+container_swap_limit_bytes{container="watch-active",namespace="rook-ceph",pod="rook-ceph-mgr-b-6c7cf686df-4754t"} 0 1790148979304
+# HELP container_swap_usage_bytes [ALPHA] Current amount of the container swap usage in bytes. Reported only on non-windows systems
+# TYPE container_swap_usage_bytes gauge
+container_swap_usage_bytes{container="ceph-crash",namespace="rook-ceph",pod="rook-ceph-crashcollector-dev-cluster-worker-1-84cbb76465-5h6lg"} 0 1790148986919
+container_swap_usage_bytes{container="ceph-exporter",namespace="rook-ceph",pod="rook-ceph-exporter-dev-cluster-worker-1-6d66995554-8g59k"} 0 1790148988481
+container_swap_usage_bytes{container="cert-manager-webhook",namespace="cert-manager",pod="cert-manager-webhook-646c95c5ff-kcd75"} 0 1790148982126
+container_swap_usage_bytes{container="cloudflare-tunnel",namespace="cloudflare-tunnel",pod="cloudflare-tunnel-7cfdcf8fcd-hcmnc"} 0 1790148982614
+container_swap_usage_bytes{container="controller",namespace="tailscale-ingress-nginx",pod="tailscale-ingress-nginx-controller-547db955c8-9fpx2"} 0 1790148984969
+container_swap_usage_bytes{container="csi-attacher",namespace="rook-ceph",pod="rook-ceph.cephfs.csi.ceph.com-ctrlplugin-59d877c-xnms5"} 0 1790148988436
+container_swap_usage_bytes{container="csi-attacher",namespace="rook-ceph",pod="rook-ceph.rbd.csi.ceph.com-ctrlplugin-b9dc56dd4-s7s4g"} 0 1790148990238
+container_swap_usage_bytes{container="csi-cephfsplugin",namespace="rook-ceph",pod="rook-ceph.cephfs.csi.ceph.com-ctrlplugin-59d877c-xnms5"} 0 1790148976167
+container_swap_usage_bytes{container="csi-cephfsplugin",namespace="rook-ceph",pod="rook-ceph.cephfs.csi.ceph.com-nodeplugin-g2gc8"} 0 1790148991389
+container_swap_usage_bytes{container="csi-provisioner",namespace="rook-ceph",pod="rook-ceph.cephfs.csi.ceph.com-ctrlplugin-59d877c-xnms5"} 0 1790148988818
+container_swap_usage_bytes{container="csi-provisioner",namespace="rook-ceph",pod="rook-ceph.rbd.csi.ceph.com-ctrlplugin-b9dc56dd4-s7s4g"} 0 1790148989300
+container_swap_usage_bytes{container="csi-rbdplugin",namespace="rook-ceph",pod="rook-ceph.rbd.csi.ceph.com-ctrlplugin-b9dc56dd4-s7s4g"} 0 1790148983496
+container_swap_usage_bytes{container="csi-rbdplugin",namespace="rook-ceph",pod="rook-ceph.rbd.csi.ceph.com-nodeplugin-9d8gm"} 0 1790148984775
+container_swap_usage_bytes{container="csi-resizer",namespace="rook-ceph",pod="rook-ceph.cephfs.csi.ceph.com-ctrlplugin-59d877c-xnms5"} 0 1790148979205
+container_swap_usage_bytes{container="csi-resizer",namespace="rook-ceph",pod="rook-ceph.rbd.csi.ceph.com-ctrlplugin-b9dc56dd4-s7s4g"} 0 1790148984693
+container_swap_usage_bytes{container="csi-snapshotter",namespace="rook-ceph",pod="rook-ceph.cephfs.csi.ceph.com-ctrlplugin-59d877c-xnms5"} 0 1790148985845
+container_swap_usage_bytes{container="csi-snapshotter",namespace="rook-ceph",pod="rook-ceph.rbd.csi.ceph.com-ctrlplugin-b9dc56dd4-s7s4g"} 0 1790148986318
+container_swap_usage_bytes{container="driver-registrar",namespace="rook-ceph",pod="rook-ceph.cephfs.csi.ceph.com-nodeplugin-g2gc8"} 0 1790148982597
+container_swap_usage_bytes{container="driver-registrar",namespace="rook-ceph",pod="rook-ceph.rbd.csi.ceph.com-nodeplugin-9d8gm"} 0 1790148979865
+container_swap_usage_bytes{container="kube-flannel",namespace="kube-system",pod="kube-flannel-g585n"} 0 1790148981393
+container_swap_usage_bytes{container="kube-proxy",namespace="kube-system",pod="kube-proxy-f5h6w"} 0 1790148978221
+container_swap_usage_bytes{container="local-path-provisioner",namespace="local-path-storage",pod="local-path-provisioner-54745b98cf-hdj89"} 0 1790148987816
+container_swap_usage_bytes{container="log-collector",namespace="rook-ceph",pod="rook-ceph-exporter-dev-cluster-worker-1-6d66995554-8g59k"} 0 1790148987120
+container_swap_usage_bytes{container="log-collector",namespace="rook-ceph",pod="rook-ceph-mds-ceph-filesystem-a-7b6785cbdf-czghw"} 0 1790148990763
+container_swap_usage_bytes{container="log-collector",namespace="rook-ceph",pod="rook-ceph-mgr-b-6c7cf686df-4754t"} 0 1790148976235
+container_swap_usage_bytes{container="log-collector",namespace="rook-ceph",pod="rook-ceph-mon-b-7c7cc8f655-5h4lt"} 0 1790148987605
+container_swap_usage_bytes{container="log-collector",namespace="rook-ceph",pod="rook-ceph-osd-0-79b577b686-cc5kr"} 0 1790148967262
+container_swap_usage_bytes{container="log-collector",namespace="rook-ceph",pod="rook-ceph-rgw-ceph-objectstore-a-8f7d755df-xms42"} 0 1790148975970
+container_swap_usage_bytes{container="log-rotator",namespace="rook-ceph",pod="rook-ceph.cephfs.csi.ceph.com-ctrlplugin-59d877c-xnms5"} 0 1790148971494
+container_swap_usage_bytes{container="log-rotator",namespace="rook-ceph",pod="rook-ceph.cephfs.csi.ceph.com-nodeplugin-g2gc8"} 0 1790148987189
+container_swap_usage_bytes{container="log-rotator",namespace="rook-ceph",pod="rook-ceph.rbd.csi.ceph.com-ctrlplugin-b9dc56dd4-s7s4g"} 0 1790148977117
+container_swap_usage_bytes{container="log-rotator",namespace="rook-ceph",pod="rook-ceph.rbd.csi.ceph.com-nodeplugin-9d8gm"} 0 1790148977592
+container_swap_usage_bytes{container="manager",namespace="rook-ceph",pod="ceph-csi-controller-manager-5fffdd447b-hcw68"} 0 1790148987000
+container_swap_usage_bytes{container="mds",namespace="rook-ceph",pod="rook-ceph-mds-ceph-filesystem-a-7b6785cbdf-czghw"} 0 1790148983653
+container_swap_usage_bytes{container="mgr",namespace="rook-ceph",pod="rook-ceph-mgr-b-6c7cf686df-4754t"} 0 1790148979376
+container_swap_usage_bytes{container="mon",namespace="rook-ceph",pod="rook-ceph-mon-b-7c7cc8f655-5h4lt"} 0 1790148978769
+container_swap_usage_bytes{container="osd",namespace="rook-ceph",pod="rook-ceph-osd-0-79b577b686-cc5kr"} 0 1790148983264
+container_swap_usage_bytes{container="rgw",namespace="rook-ceph",pod="rook-ceph-rgw-ceph-objectstore-a-8f7d755df-xms42"} 0 1790148983475
+container_swap_usage_bytes{container="rke2-snapshot-controller",namespace="kube-system",pod="snapshot-controller-rke2-snapshot-controller-54f665d4bd-5xnr6"} 0 1790148974460
+container_swap_usage_bytes{container="rook-ceph-operator",namespace="rook-ceph",pod="rook-ceph-operator-bdd664cb7-sq596"} 0 1790148979566
+container_swap_usage_bytes{container="test-tailscale-ingress-nginx",namespace="test-tailscale-ingress-nginx",pod="test-tailscale-ingress-nginx-bc8f84d5-nnw4t"} 0 1790148987717
+container_swap_usage_bytes{container="watch-active",namespace="rook-ceph",pod="rook-ceph-mgr-b-6c7cf686df-4754t"} 0 1790148979304
+# HELP node_cpu_usage_seconds_total [STABLE] Cumulative cpu time consumed by the node in core-seconds
+# TYPE node_cpu_usage_seconds_total counter
+node_cpu_usage_seconds_total 3361.600779 1790148989709
+# HELP node_memory_working_set_bytes [STABLE] Current working set of the node in bytes
+# TYPE node_memory_working_set_bytes gauge
+node_memory_working_set_bytes 3.562364928e+09 1790148989709
+# HELP node_swap_usage_bytes [ALPHA] Current swap usage of the node in bytes. Reported only on non-windows systems
+# TYPE node_swap_usage_bytes gauge
+node_swap_usage_bytes 0 1790148989709
+# HELP pod_cpu_usage_seconds_total [STABLE] Cumulative cpu time consumed by the pod in core-seconds
+# TYPE pod_cpu_usage_seconds_total counter
+pod_cpu_usage_seconds_total{namespace="cert-manager",pod="cert-manager-webhook-646c95c5ff-kcd75"} 2.592454 1790148986237
+pod_cpu_usage_seconds_total{namespace="cloudflare-tunnel",pod="cloudflare-tunnel-7cfdcf8fcd-hcmnc"} 14.685587 1790148980214
+pod_cpu_usage_seconds_total{namespace="kube-system",pod="kube-flannel-g585n"} 0.936525 1790148978195
+pod_cpu_usage_seconds_total{namespace="kube-system",pod="kube-proxy-f5h6w"} 1.561833 1790148985240
+pod_cpu_usage_seconds_total{namespace="kube-system",pod="snapshot-controller-rke2-snapshot-controller-54f665d4bd-5xnr6"} 5.994101 1790148985544
+pod_cpu_usage_seconds_total{namespace="local-path-storage",pod="local-path-provisioner-54745b98cf-hdj89"} 4.895073 1790148974950
+pod_cpu_usage_seconds_total{namespace="rook-ceph",pod="ceph-csi-controller-manager-5fffdd447b-hcw68"} 8.256817 1790148986931
+pod_cpu_usage_seconds_total{namespace="rook-ceph",pod="rook-ceph-crashcollector-dev-cluster-worker-1-84cbb76465-5h6lg"} 0.347965 1790148975087
+pod_cpu_usage_seconds_total{namespace="rook-ceph",pod="rook-ceph-exporter-dev-cluster-worker-1-6d66995554-8g59k"} 28.832514 1790148987879
+pod_cpu_usage_seconds_total{namespace="rook-ceph",pod="rook-ceph-mds-ceph-filesystem-a-7b6785cbdf-czghw"} 93.273115 1790148987936
+pod_cpu_usage_seconds_total{namespace="rook-ceph",pod="rook-ceph-mgr-b-6c7cf686df-4754t"} 233.122793 1790148982383
+pod_cpu_usage_seconds_total{namespace="rook-ceph",pod="rook-ceph-mon-b-7c7cc8f655-5h4lt"} 148.805853 1790148986162
+pod_cpu_usage_seconds_total{namespace="rook-ceph",pod="rook-ceph-operator-bdd664cb7-sq596"} 242.915966 1790148989846
+pod_cpu_usage_seconds_total{namespace="rook-ceph",pod="rook-ceph-osd-0-79b577b686-cc5kr"} 127.510734 1790148988600
+pod_cpu_usage_seconds_total{namespace="rook-ceph",pod="rook-ceph-rgw-ceph-objectstore-a-8f7d755df-xms42"} 76.39192 1790148987480
+pod_cpu_usage_seconds_total{namespace="rook-ceph",pod="rook-ceph.cephfs.csi.ceph.com-ctrlplugin-59d877c-xnms5"} 32.745725 1790148983521
+pod_cpu_usage_seconds_total{namespace="rook-ceph",pod="rook-ceph.cephfs.csi.ceph.com-nodeplugin-g2gc8"} 0.958443 1790148989837
+pod_cpu_usage_seconds_total{namespace="rook-ceph",pod="rook-ceph.rbd.csi.ceph.com-ctrlplugin-b9dc56dd4-s7s4g"} 37.390304 1790148976669
+pod_cpu_usage_seconds_total{namespace="rook-ceph",pod="rook-ceph.rbd.csi.ceph.com-nodeplugin-9d8gm"} 1.298642 1790148985716
+pod_cpu_usage_seconds_total{namespace="tailscale-ingress-nginx",pod="tailscale-ingress-nginx-controller-547db955c8-9fpx2"} 35.213027 1790148979877
+pod_cpu_usage_seconds_total{namespace="test-tailscale-ingress-nginx",pod="test-tailscale-ingress-nginx-bc8f84d5-nnw4t"} 0.132728 1790148976938
+# HELP pod_memory_working_set_bytes [STABLE] Current working set of the pod in bytes
+# TYPE pod_memory_working_set_bytes gauge
+pod_memory_working_set_bytes{namespace="cert-manager",pod="cert-manager-webhook-646c95c5ff-kcd75"} 5.965824e+07 1790148986237
+pod_memory_working_set_bytes{namespace="cloudflare-tunnel",pod="cloudflare-tunnel-7cfdcf8fcd-hcmnc"} 3.7711872e+07 1790148980214
+pod_memory_working_set_bytes{namespace="kube-system",pod="kube-flannel-g585n"} 5.6283136e+07 1790148978195
+pod_memory_working_set_bytes{namespace="kube-system",pod="kube-proxy-f5h6w"} 6.2287872e+07 1790148985240
+pod_memory_working_set_bytes{namespace="kube-system",pod="snapshot-controller-rke2-snapshot-controller-54f665d4bd-5xnr6"} 6.504448e+07 1790148985544
+pod_memory_working_set_bytes{namespace="local-path-storage",pod="local-path-provisioner-54745b98cf-hdj89"} 5.1007488e+07 1790148974950
+pod_memory_working_set_bytes{namespace="rook-ceph",pod="ceph-csi-controller-manager-5fffdd447b-hcw68"} 6.0329984e+07 1790148986931
+pod_memory_working_set_bytes{namespace="rook-ceph",pod="rook-ceph-crashcollector-dev-cluster-worker-1-84cbb76465-5h6lg"} 7.467008e+06 1790148975087
+pod_memory_working_set_bytes{namespace="rook-ceph",pod="rook-ceph-exporter-dev-cluster-worker-1-6d66995554-8g59k"} 1.7563648e+07 1790148987879
+pod_memory_working_set_bytes{namespace="rook-ceph",pod="rook-ceph-mds-ceph-filesystem-a-7b6785cbdf-czghw"} 3.9723008e+07 1790148987936
+pod_memory_working_set_bytes{namespace="rook-ceph",pod="rook-ceph-mgr-b-6c7cf686df-4754t"} 3.14462208e+08 1790148982383
+pod_memory_working_set_bytes{namespace="rook-ceph",pod="rook-ceph-mon-b-7c7cc8f655-5h4lt"} 1.48369408e+08 1790148986162
+pod_memory_working_set_bytes{namespace="rook-ceph",pod="rook-ceph-operator-bdd664cb7-sq596"} 8.333312e+07 1790148989846
+pod_memory_working_set_bytes{namespace="rook-ceph",pod="rook-ceph-osd-0-79b577b686-cc5kr"} 3.02292992e+08 1790148988600
+pod_memory_working_set_bytes{namespace="rook-ceph",pod="rook-ceph-rgw-ceph-objectstore-a-8f7d755df-xms42"} 1.6228352e+08 1790148987480
+pod_memory_working_set_bytes{namespace="rook-ceph",pod="rook-ceph.cephfs.csi.ceph.com-ctrlplugin-59d877c-xnms5"} 6.8579328e+07 1790148983521
+pod_memory_working_set_bytes{namespace="rook-ceph",pod="rook-ceph.cephfs.csi.ceph.com-nodeplugin-g2gc8"} 7.606272e+07 1790148989837
+pod_memory_working_set_bytes{namespace="rook-ceph",pod="rook-ceph.rbd.csi.ceph.com-ctrlplugin-b9dc56dd4-s7s4g"} 2.66866688e+08 1790148976669
+pod_memory_working_set_bytes{namespace="rook-ceph",pod="rook-ceph.rbd.csi.ceph.com-nodeplugin-9d8gm"} 7.3998336e+07 1790148985716
+pod_memory_working_set_bytes{namespace="tailscale-ingress-nginx",pod="tailscale-ingress-nginx-controller-547db955c8-9fpx2"} 1.73379584e+08 1790148979877
+pod_memory_working_set_bytes{namespace="test-tailscale-ingress-nginx",pod="test-tailscale-ingress-nginx-bc8f84d5-nnw4t"} 2.0078592e+07 1790148976938
+# HELP pod_swap_usage_bytes [ALPHA] Current amount of the pod swap usage in bytes. Reported only on non-windows systems
+# TYPE pod_swap_usage_bytes gauge
+pod_swap_usage_bytes{namespace="cert-manager",pod="cert-manager-webhook-646c95c5ff-kcd75"} 0 1790148986237
+pod_swap_usage_bytes{namespace="cloudflare-tunnel",pod="cloudflare-tunnel-7cfdcf8fcd-hcmnc"} 0 1790148980214
+pod_swap_usage_bytes{namespace="kube-system",pod="kube-flannel-g585n"} 0 1790148978195
+pod_swap_usage_bytes{namespace="kube-system",pod="kube-proxy-f5h6w"} 0 1790148985240
+pod_swap_usage_bytes{namespace="kube-system",pod="snapshot-controller-rke2-snapshot-controller-54f665d4bd-5xnr6"} 0 1790148985544
+pod_swap_usage_bytes{namespace="local-path-storage",pod="local-path-provisioner-54745b98cf-hdj89"} 0 1790148974950
+pod_swap_usage_bytes{namespace="rook-ceph",pod="ceph-csi-controller-manager-5fffdd447b-hcw68"} 0 1790148986931
+pod_swap_usage_bytes{namespace="rook-ceph",pod="rook-ceph-crashcollector-dev-cluster-worker-1-84cbb76465-5h6lg"} 0 1790148975087
+pod_swap_usage_bytes{namespace="rook-ceph",pod="rook-ceph-exporter-dev-cluster-worker-1-6d66995554-8g59k"} 0 1790148987879
+pod_swap_usage_bytes{namespace="rook-ceph",pod="rook-ceph-mds-ceph-filesystem-a-7b6785cbdf-czghw"} 0 1790148987936
+pod_swap_usage_bytes{namespace="rook-ceph",pod="rook-ceph-mgr-b-6c7cf686df-4754t"} 0 1790148982383
+pod_swap_usage_bytes{namespace="rook-ceph",pod="rook-ceph-mon-b-7c7cc8f655-5h4lt"} 0 1790148986162
+pod_swap_usage_bytes{namespace="rook-ceph",pod="rook-ceph-operator-bdd664cb7-sq596"} 0 1790148989846
+pod_swap_usage_bytes{namespace="rook-ceph",pod="rook-ceph-osd-0-79b577b686-cc5kr"} 0 1790148988600
+pod_swap_usage_bytes{namespace="rook-ceph",pod="rook-ceph-rgw-ceph-objectstore-a-8f7d755df-xms42"} 0 1790148987480
+pod_swap_usage_bytes{namespace="rook-ceph",pod="rook-ceph.cephfs.csi.ceph.com-ctrlplugin-59d877c-xnms5"} 0 1790148983521
+pod_swap_usage_bytes{namespace="rook-ceph",pod="rook-ceph.cephfs.csi.ceph.com-nodeplugin-g2gc8"} 0 1790148989837
+pod_swap_usage_bytes{namespace="rook-ceph",pod="rook-ceph.rbd.csi.ceph.com-ctrlplugin-b9dc56dd4-s7s4g"} 0 1790148976669
+pod_swap_usage_bytes{namespace="rook-ceph",pod="rook-ceph.rbd.csi.ceph.com-nodeplugin-9d8gm"} 0 1790148985716
+pod_swap_usage_bytes{namespace="tailscale-ingress-nginx",pod="tailscale-ingress-nginx-controller-547db955c8-9fpx2"} 0 1790148979877
+pod_swap_usage_bytes{namespace="test-tailscale-ingress-nginx",pod="test-tailscale-ingress-nginx-bc8f84d5-nnw4t"} 0 1790148976938
+# HELP resource_scrape_error [STABLE] 1 if there was an error while getting container metrics, 0 otherwise
+# TYPE resource_scrape_error gauge
+resource_scrape_error 0
