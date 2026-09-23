@@ -21,7 +21,7 @@ env:
 jobs:
   image:
     name: build and push image
-    runs-on: self-hosted-dind
+    runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
       - name: Checkout
