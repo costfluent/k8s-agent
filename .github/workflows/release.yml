@@ -25,7 +25,8 @@ env:
 jobs:
   image:
     name: build and push image
-    runs-on: ubuntu-latest
+    runs-on: self-hosted-dind
+    timeout-minutes: 20
     steps:
       - name: Checkout
         uses: actions/checkout@v5
@@ -52,6 +53,11 @@ jobs:
             type=semver,pattern={{major}}.{{minor}}
             type=raw,value=latest
 
+      # The tagged commit's time, so rebuilding a tag reproduces the same BuildTime.
+      - name: Commit time
+        id: commit
+        run: echo "time=$(TZ=UTC0 git log -1 --date=format-local:%Y-%m-%dT%H:%M:%SZ --format=%cd)" >> "$GITHUB_OUTPUT"
+
       # Both architectures matter for a cost agent: arm64 node pools are one of the cheapest
       # optimisations a customer makes, so shipping amd64 only would exclude the clusters most
       # likely to care about cost.
@@ -70,7 +76,7 @@ jobs:
           build-args: |
             VERSION=${{ github.ref_name }}
             GIT_COMMIT=${{ github.sha }}
-            BUILD_TIME=${{ github.event.repository.updated_at }}
+            BUILD_TIME=${{ steps.commit.outputs.time }}
 
       - name: Summary
         run: |

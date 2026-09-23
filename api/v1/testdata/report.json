@@ -1,0 +1,115 @@
+{
+  "schema_version": 1,
+  "cluster_id": "pve-dev",
+  "agent_version": "0.2.0",
+  "agent_instance_id": "6f1c1d2e-3a4b-4c5d-8e9f-0a1b2c3d4e5f",
+  "window_start": "2026-09-23T10:00:00Z",
+  "window_end": "2026-09-23T11:00:00Z",
+  "nodes": [
+    {
+      "name": "aks-system-12345678-vmss000000",
+      "provider_id": "azure:///subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/mc_rg_aks_westeurope/providers/Microsoft.Compute/virtualMachineScaleSets/aks-system-12345678-vmss/virtualMachines/0",
+      "instance_type": "Standard_D4s_v5",
+      "region": "westeurope",
+      "zone": "westeurope-1",
+      "spot": false,
+      "observed_seconds": 3600,
+      "capacity_cpu_cores": 4,
+      "capacity_memory_bytes": 17179869184,
+      "capacity_gpu": 0,
+      "allocatable_cpu_cores": 3.86,
+      "allocatable_memory_bytes": 13958643712,
+      "labels": {
+        "kubernetes.io/os": "linux",
+        "node.kubernetes.io/instance-type": "Standard_D4s_v5"
+      }
+    },
+    {
+      "name": "talos-worker-1",
+      "spot": false,
+      "observed_seconds": 1800,
+      "capacity_cpu_cores": 8,
+      "capacity_memory_bytes": 34359738368,
+      "capacity_gpu": 1,
+      "allocatable_cpu_cores": 7.9,
+      "allocatable_memory_bytes": 33285996544,
+      "annotations": {
+        "costfluent.com/gpu-hourly-rate": "0.9",
+        "costfluent.com/ram-gb-hourly-rate": "0.003",
+        "costfluent.com/vcpu-hourly-rate": "0.021"
+      }
+    }
+  ],
+  "pods": [
+    {
+      "namespace": "kube-system",
+      "name": "coredns-7db6d8ff4d-abcde",
+      "node": "aks-system-12345678-vmss000000",
+      "controller_kind": "Deployment",
+      "controller": "coredns",
+      "labels": {
+        "k8s-app": "kube-dns"
+      },
+      "containers": [
+        {
+          "name": "coredns",
+          "observed_seconds": 3600,
+          "cpu_request_cores": 0.1,
+          "memory_request_bytes": 73400320,
+          "gpu_request": 0,
+          "cpu_usage_core_seconds": 14.4,
+          "memory_usage_byte_seconds": 90596966400,
+          "cpu_allocated_core_seconds": 360,
+          "memory_allocated_byte_seconds": 264241152000,
+          "cpu_usage_peak_cores": 0.012,
+          "memory_usage_peak_bytes": 26214400
+        }
+      ]
+    },
+    {
+      "namespace": "ml",
+      "name": "trainer-0",
+      "node": "talos-worker-1",
+      "controller_kind": "StatefulSet",
+      "controller": "trainer",
+      "labels": {
+        "app": "trainer",
+        "team": "research"
+      },
+      "annotations": {
+        "owner": "research@example.com"
+      },
+      "namespace_labels": {
+        "cost-center": "rnd"
+      },
+      "containers": [
+        {
+          "name": "trainer",
+          "observed_seconds": 1800,
+          "cpu_request_cores": 2,
+          "memory_request_bytes": 4294967296,
+          "gpu_request": 1,
+          "cpu_usage_core_seconds": 4500,
+          "memory_usage_byte_seconds": 5153960755200,
+          "cpu_allocated_core_seconds": 4500,
+          "memory_allocated_byte_seconds": 7730941132800,
+          "cpu_usage_peak_cores": 3.1,
+          "memory_usage_peak_bytes": 3221225472
+        },
+        {
+          "name": "sidecar",
+          "observed_seconds": 1800,
+          "cpu_request_cores": 0.05,
+          "memory_request_bytes": 33554432,
+          "gpu_request": 0,
+          "cpu_usage_core_seconds": 9,
+          "memory_usage_byte_seconds": 28991029248,
+          "cpu_allocated_core_seconds": 90,
+          "memory_allocated_byte_seconds": 60397977600,
+          "cpu_usage_peak_cores": 0.01,
+          "memory_usage_peak_bytes": 20971520
+        }
+      ]
+    }
+  ]
+}

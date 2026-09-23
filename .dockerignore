@@ -5,6 +5,5 @@ Dockerfile
 README.md
 *.md
 .idea
-.vscode
 bin/
 dist/

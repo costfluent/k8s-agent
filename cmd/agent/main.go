@@ -1,11 +1,18 @@
+// Command agent collects Kubernetes usage and reports it to Costfluent.
 package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
+	"strconv"
+	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -14,11 +21,10 @@ import (
 	"go.uber.org/zap/zapcore"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
-	metricsclient "k8s.io/metrics/pkg/client/clientset/versioned"
 
+	v1 "github.com/costfluent/k8s-agent/api/v1"
 	"github.com/costfluent/k8s-agent/internal/collector"
 	"github.com/costfluent/k8s-agent/internal/config"
-	"github.com/costfluent/k8s-agent/internal/health"
 	"github.com/costfluent/k8s-agent/internal/metrics"
 	"github.com/costfluent/k8s-agent/internal/reporter"
 	"github.com/costfluent/k8s-agent/internal/storage"
@@ -30,323 +36,275 @@ var (
 	GitCommit = "unknown"
 )
 
+const (
+	snapshotEvery   = 5 * time.Minute
+	shutdownTimeout = 20 * time.Second
+	snapshotFile    = "window.json"
+)
+
 func main() {
-	// Load configuration
-	cfg, err := config.Load()
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error loading config: %v\n", err)
+	if err := run(); err != nil {
+		fmt.Fprintf(os.Stderr, "costfluent-k8s-agent: %v\n", err)
 		os.Exit(1)
 	}
-
-	// Setup logger
-	logger := setupLogger(cfg.LogLevel, cfg.LogFormat)
-	defer logger.Sync()
-
-	logger.Info("starting costfluent-k8s-agent",
-		zap.String("version", Version),
-		zap.String("build_time", BuildTime),
-		zap.String("git_commit", GitCommit),
-		zap.String("cluster_id", cfg.ClusterID))
-
-	// Create Kubernetes clients
-	k8sConfig, err := rest.InClusterConfig()
-	if err != nil {
-		logger.Fatal("failed to get in-cluster config", zap.Error(err))
-	}
-
-	k8sClient, err := kubernetes.NewForConfig(k8sConfig)
-	if err != nil {
-		logger.Fatal("failed to create kubernetes client", zap.Error(err))
-	}
-
-	metricsClient, err := metricsclient.NewForConfig(k8sConfig)
-	if err != nil {
-		logger.Fatal("failed to create metrics client", zap.Error(err))
-	}
-
-	// Initialize components
-	buffer, err := storage.NewBuffer(cfg.DataDir, logger)
-	if err != nil {
-		logger.Fatal("failed to create buffer", zap.Error(err))
-	}
-
-	kubeletCollector := collector.NewKubeletCollector(k8sClient, metricsClient, cfg, logger)
-	metadataCollector := collector.NewMetadataCollector(k8sClient, cfg, logger)
-	aggregator := collector.NewAggregator(logger)
-	httpReporter := reporter.NewHTTPReporter(cfg, Version, logger)
-	healthChecker := health.NewChecker(k8sClient, cfg.APIEndpoint)
-
-	// Start metrics server
-	if cfg.MetricsEnabled {
-		go startMetricsServer(cfg.MetricsPort, healthChecker, logger)
-	}
-
-	// Set agent info metric
-	metrics.SetAgentInfo(Version, cfg.ClusterID, cfg.ClusterName)
-
-	// Setup context with cancellation
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	// Handle shutdown signals
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-	go func() {
-		sig := <-sigCh
-		logger.Info("received shutdown signal", zap.String("signal", sig.String()))
-		cancel()
-	}()
-
-	// Retry any pending reports from buffer
-	go retryPendingReports(ctx, buffer, httpReporter, logger)
-
-	// Run the agent
-	run(ctx, cfg, kubeletCollector, metadataCollector, aggregator, httpReporter, buffer, healthChecker, logger)
-
-	logger.Info("agent shutdown complete")
 }
 
-func run(
-	ctx context.Context,
-	cfg *config.Config,
-	kubeletCollector *collector.KubeletCollector,
-	metadataCollector *collector.MetadataCollector,
-	aggregator *collector.Aggregator,
-	httpReporter *reporter.HTTPReporter,
-	buffer *storage.Buffer,
-	healthChecker *health.Checker,
-	logger *zap.Logger,
-) {
-	pollingTicker := time.NewTicker(cfg.PollingInterval)
-	defer pollingTicker.Stop()
+func run() error {
+	cfg, err := config.Load()
+	if err != nil {
+		return fmt.Errorf("configuration: %w", err)
+	}
+	logger, err := newLogger(cfg.LogLevel, cfg.LogFormat)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = logger.Sync() }()
+	for _, w := range cfg.Warnings {
+		logger.Warn(w)
+	}
+	logger.Info("starting costfluent-k8s-agent",
+		zap.String("version", Version), zap.String("git_commit", GitCommit), zap.String("build_time", BuildTime),
+		zap.String("cluster_id", cfg.ClusterID), zap.String("api_endpoint", cfg.APIEndpoint.String()),
+		zap.Duration("polling_interval", cfg.PollingInterval))
 
-	reportingTicker := time.NewTicker(cfg.ReportingInterval)
-	defer reportingTicker.Stop()
+	buffer, err := storage.Open(cfg.DataDir, logger)
+	if err != nil {
+		return err
+	}
+	instanceID, err := storage.InstanceID(cfg.DataDir)
+	if err != nil {
+		return err
+	}
 
-	heartbeatTicker := time.NewTicker(cfg.HeartbeatInterval)
-	defer heartbeatTicker.Stop()
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
 
-	// Start first aggregation window
-	aggregator.StartWindow(time.Now().UTC())
+	var ready atomic.Bool
+	server := &http.Server{
+		Addr:              net.JoinHostPort("", strconv.Itoa(cfg.MetricsPort)),
+		Handler:           newMux(&ready),
+		ReadHeaderTimeout: 5 * time.Second,
+	}
+	serverErr := make(chan error, 1)
+	go func() {
+		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			serverErr <- fmt.Errorf("serving health and metrics on %s: %w", server.Addr, err)
+		}
+	}()
+	defer func() {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = server.Shutdown(shutdownCtx)
+	}()
 
-	logger.Info("agent started",
-		zap.Duration("polling_interval", cfg.PollingInterval),
-		zap.Duration("reporting_interval", cfg.ReportingInterval),
-		zap.Duration("heartbeat_interval", cfg.HeartbeatInterval))
+	restCfg, err := rest.InClusterConfig()
+	if err != nil {
+		return fmt.Errorf("in-cluster configuration: %w", err)
+	}
+	client, err := kubernetes.NewForConfig(restCfg)
+	if err != nil {
+		return fmt.Errorf("kubernetes client: %w", err)
+	}
+	kubeletClient, err := kubeletHTTPClient(restCfg, cfg.KubeSkipTLSVerify)
+	if err != nil {
+		return err
+	}
 
+	metadata := collector.NewMetadata(client, cfg, logger)
+	if err := metadata.Start(ctx); err != nil {
+		return err
+	}
+	kubelet := collector.NewKubeletCollector(kubeletClient, cfg.NodeAddressTypes, logger)
+	metrics.Info.WithLabelValues(Version, cfg.ClusterID).Set(1)
+
+	a := &agent{
+		interval:     cfg.PollingInterval,
+		snapshotPath: filepath.Join(cfg.DataDir, snapshotFile),
+		aggregator:   collector.NewAggregator(cfg.ClusterID, Version, instanceID, cfg.PollingInterval, time.Now()),
+		buffer:       buffer,
+		sender:       reporter.NewSender(buffer, reporter.NewClient(cfg.APIEndpoint, cfg.Token, Version, cfg.ReportHTTPProxy), logger),
+		collect:      collectFunc(metadata, kubelet),
+		now:          time.Now,
+		ready:        &ready,
+		logger:       logger,
+	}
+
+	done := make(chan struct{})
+	go func() {
+		a.run(ctx)
+		close(done)
+	}()
+	select {
+	case err := <-serverErr:
+		stop()
+		<-done
+		return err
+	case <-done:
+		logger.Info("agent stopped")
+		return nil
+	}
+}
+
+func newMux(ready *atomic.Bool) *http.ServeMux {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("ok\n"))
+	})
+	mux.HandleFunc("/readyz", func(w http.ResponseWriter, _ *http.Request) {
+		if !ready.Load() {
+			http.Error(w, "waiting for the first poll", http.StatusServiceUnavailable)
+			return
+		}
+		_, _ = w.Write([]byte("ok\n"))
+	})
+	mux.Handle("/metrics", promhttp.Handler())
+	return mux
+}
+
+// kubeletHTTPClient authenticates with the service-account token, re-read as it rotates, and
+// verifies kubelets against the cluster CA unless skipVerify. Many distributions (kind, Talos)
+// serve kubelet certificates that are self-signed per node, which only skipVerify accepts.
+func kubeletHTTPClient(restCfg *rest.Config, skipVerify bool) (*http.Client, error) {
+	cfg := rest.CopyConfig(restCfg)
+	if skipVerify {
+		cfg.TLSClientConfig = rest.TLSClientConfig{Insecure: true}
+	}
+	rt, err := rest.TransportFor(cfg)
+	if err != nil {
+		return nil, fmt.Errorf("kubelet transport: %w", err)
+	}
+	return &http.Client{Transport: rt}, nil
+}
+
+func collectFunc(metadata *collector.Metadata, kubelet *collector.KubeletCollector) func(context.Context, time.Time) (collector.Observation, error) {
+	return func(ctx context.Context, now time.Time) (collector.Observation, error) {
+		nodes, err := metadata.Nodes()
+		if err != nil {
+			return collector.Observation{}, err
+		}
+		pods, err := metadata.Pods(ctx)
+		if err != nil {
+			return collector.Observation{}, err
+		}
+		obs := collector.Observation{Time: now, Pods: pods, Usage: kubelet.Scrape(ctx, nodes)}
+		for _, n := range nodes {
+			obs.Nodes = append(obs.Nodes, collector.ConvertNode(n))
+		}
+		return obs, nil
+	}
+}
+
+type agent struct {
+	interval     time.Duration
+	snapshotPath string
+	aggregator   *collector.Aggregator
+	buffer       *storage.Buffer
+	sender       *reporter.Sender
+	collect      func(context.Context, time.Time) (collector.Observation, error)
+	now          func() time.Time
+	ready        *atomic.Bool
+	logger       *zap.Logger
+}
+
+// run polls until ctx ends, then closes the open window and flushes the buffer on a fresh
+// context, because ctx is already cancelled by then.
+func (a *agent) run(ctx context.Context) {
+	if closed, err := a.aggregator.RestoreSnapshot(a.snapshotPath, a.now()); err != nil {
+		a.logger.Warn("discarding the window snapshot", zap.Error(err))
+	} else if closed != nil {
+		a.put(*closed)
+	}
+	start, end := a.aggregator.Window()
+	a.logger.Info("collecting", zap.Time("window_start", start), zap.Time("window_end", end))
+
+	senderCtx, stopSender := context.WithCancel(context.Background())
+	var senderDone sync.WaitGroup
+	senderDone.Add(1)
+	go func() {
+		defer senderDone.Done()
+		a.sender.Run(senderCtx)
+	}()
+	a.sender.Wake()
+
+	ticker := time.NewTicker(a.interval)
+	defer ticker.Stop()
+	lastSnapshot := a.now()
+	a.poll(ctx)
 	for {
 		select {
 		case <-ctx.Done():
-			// Send final report before shutdown
-			logger.Info("sending final report before shutdown")
-			sendReport(ctx, cfg, aggregator, httpReporter, buffer, healthChecker, logger)
+			stopSender()
+			senderDone.Wait()
+			a.shutdown()
 			return
-
-		case <-pollingTicker.C:
-			collectMetrics(ctx, kubeletCollector, metadataCollector, aggregator, healthChecker, logger)
-
-		case <-reportingTicker.C:
-			sendReport(ctx, cfg, aggregator, httpReporter, buffer, healthChecker, logger)
-			aggregator.StartWindow(time.Now().UTC())
-
-		case <-heartbeatTicker.C:
-			sendHeartbeat(ctx, aggregator, httpReporter, logger)
+		case <-ticker.C:
+			a.poll(ctx)
+			if now := a.now(); now.Sub(lastSnapshot) >= snapshotEvery {
+				lastSnapshot = now
+				if err := a.aggregator.SaveSnapshot(a.snapshotPath); err != nil {
+					a.logger.Warn("saving the window snapshot failed", zap.Error(err))
+				}
+			}
 		}
 	}
 }
 
-func collectMetrics(
-	ctx context.Context,
-	kubeletCollector *collector.KubeletCollector,
-	metadataCollector *collector.MetadataCollector,
-	aggregator *collector.Aggregator,
-	healthChecker *health.Checker,
-	logger *zap.Logger,
-) {
-	start := time.Now()
-
-	// Collect node info
-	nodes, err := metadataCollector.CollectNodes(ctx)
+func (a *agent) poll(ctx context.Context) {
+	began := time.Now()
+	obs, err := a.collect(ctx, a.now())
+	metrics.PollDuration.Observe(time.Since(began).Seconds())
 	if err != nil {
-		logger.Error("failed to collect nodes", zap.Error(err))
-	} else {
-		aggregator.AddNodes(nodes)
-	}
-
-	// Collect container metrics
-	containerMetrics, err := kubeletCollector.Collect(ctx)
-	if err != nil {
-		logger.Error("failed to collect metrics", zap.Error(err))
+		if ctx.Err() == nil {
+			a.logger.Warn("poll failed", zap.Error(err))
+		}
 		return
 	}
-
-	aggregator.AddMetrics(containerMetrics)
-
-	// Enrich with metadata
-	podMetrics := collector.BuildPodMetricsFromRaw(containerMetrics)
-	if err := metadataCollector.CollectPodMetadata(ctx, podMetrics); err != nil {
-		logger.Warn("failed to collect pod metadata", zap.Error(err))
+	a.ready.Store(true)
+	for _, r := range a.aggregator.Observe(obs) {
+		a.put(r)
 	}
-
-	// Merge enriched metadata into aggregator
-	aggregator.AddPodMetadata(podMetrics)
-
-	nodeCount, podCount, sampleCount := aggregator.GetStats()
-
-	// Record prometheus metrics and health
-	metrics.RecordScrape(time.Since(start).Seconds(), nodeCount, podCount, sampleCount)
-	healthChecker.RecordScrape()
-
-	logger.Debug("collected metrics",
-		zap.Int("nodes", nodeCount),
-		zap.Int("pods", podCount),
-		zap.Int("samples", sampleCount),
-		zap.Duration("duration", time.Since(start)))
+	a.sender.Wake()
 }
 
-func sendReport(
-	ctx context.Context,
-	cfg *config.Config,
-	aggregator *collector.Aggregator,
-	httpReporter *reporter.HTTPReporter,
-	buffer *storage.Buffer,
-	healthChecker *health.Checker,
-	logger *zap.Logger,
-) {
-	report := aggregator.CloseWindow(time.Now().UTC(), cfg.ClusterID, cfg.ClusterName, Version)
-
-	if len(report.PodMetrics) == 0 {
-		logger.Warn("no metrics to report, skipping")
+func (a *agent) put(r v1.Report) {
+	if err := a.buffer.Put(r); err != nil {
+		a.logger.Error("buffering a closed window failed; it is lost", zap.Error(err))
 		return
 	}
+	a.logger.Info("window closed", zap.Time("window_start", r.WindowStart), zap.Time("window_end", r.WindowEnd),
+		zap.Int("nodes", len(r.Nodes)), zap.Int("pods", len(r.Pods)))
+}
 
-	// Try to send immediately
-	err := httpReporter.SendReport(ctx, report)
-	if err != nil {
-		logger.Error("failed to send report, buffering", zap.Error(err))
-
-		// Save to buffer for retry
-		reportID, bufferErr := buffer.SaveReport(report)
-		if bufferErr != nil {
-			logger.Error("failed to buffer report", zap.Error(bufferErr))
-			return
-		}
-
-		logger.Info("report buffered for retry", zap.String("report_id", reportID))
-		buffer.UpdateMetrics()
-	} else {
-		healthChecker.RecordReport()
+func (a *agent) shutdown() {
+	a.logger.Info("shutting down: closing the open window and flushing the buffer")
+	if r, ok := a.aggregator.Finish(a.now()); ok {
+		a.put(r)
+	}
+	if err := os.Remove(a.snapshotPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+		a.logger.Warn("removing the window snapshot failed", zap.Error(err))
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
+	defer cancel()
+	a.sender.Drain(ctx, true)
+	if n, err := a.buffer.Len(); err == nil && n > 0 {
+		a.logger.Warn("reports left in the buffer are sent on the next start", zap.Int("buffered_reports", n))
 	}
 }
 
-func sendHeartbeat(
-	ctx context.Context,
-	aggregator *collector.Aggregator,
-	httpReporter *reporter.HTTPReporter,
-	logger *zap.Logger,
-) {
-	nodeCount, podCount, _ := aggregator.GetStats()
-
-	err := httpReporter.SendHeartbeat(ctx, nodeCount, podCount)
-	metrics.RecordHeartbeat(err == nil)
-	if err != nil {
-		logger.Warn("failed to send heartbeat", zap.Error(err))
-	}
-}
-
-func retryPendingReports(
-	ctx context.Context,
-	buffer *storage.Buffer,
-	httpReporter *reporter.HTTPReporter,
-	logger *zap.Logger,
-) {
-	// Wait a bit before retrying
-	time.Sleep(10 * time.Second)
-
-	reportIDs, err := buffer.ListPendingReports()
-	if err != nil {
-		logger.Error("failed to list pending reports", zap.Error(err))
-		return
-	}
-
-	if len(reportIDs) == 0 {
-		return
-	}
-
-	logger.Info("retrying pending reports", zap.Int("count", len(reportIDs)))
-
-	for _, reportID := range reportIDs {
-		select {
-		case <-ctx.Done():
-			return
-		default:
-		}
-
-		report, err := buffer.LoadReport(reportID)
-		if err != nil {
-			logger.Error("failed to load buffered report",
-				zap.String("report_id", reportID),
-				zap.Error(err))
-			continue
-		}
-
-		err = httpReporter.SendReport(ctx, report)
-		if err != nil {
-			logger.Warn("failed to send buffered report",
-				zap.String("report_id", reportID),
-				zap.Error(err))
-			continue
-		}
-
-		// Delete from buffer on success
-		if err := buffer.DeleteReport(reportID); err != nil {
-			logger.Error("failed to delete buffered report",
-				zap.String("report_id", reportID),
-				zap.Error(err))
-		}
-
-		buffer.UpdateMetrics()
-		logger.Info("sent buffered report", zap.String("report_id", reportID))
-	}
-}
-
-func startMetricsServer(port int, healthChecker *health.Checker, logger *zap.Logger) {
-	mux := http.NewServeMux()
-	mux.Handle("/metrics", promhttp.Handler())
-	mux.HandleFunc("/healthz", healthChecker.LivenessHandler())
-	mux.HandleFunc("/readyz", healthChecker.ReadinessHandler())
-
-	addr := fmt.Sprintf(":%d", port)
-	logger.Info("starting metrics server", zap.String("addr", addr))
-
-	if err := http.ListenAndServe(addr, mux); err != nil {
-		logger.Error("metrics server error", zap.Error(err))
-	}
-}
-
-func setupLogger(level, format string) *zap.Logger {
+func newLogger(level, format string) (*zap.Logger, error) {
 	var lvl zapcore.Level
-	switch level {
-	case "debug":
-		lvl = zapcore.DebugLevel
-	case "warn":
-		lvl = zapcore.WarnLevel
-	case "error":
-		lvl = zapcore.ErrorLevel
-	default:
-		lvl = zapcore.InfoLevel
+	if err := lvl.UnmarshalText([]byte(level)); err != nil {
+		return nil, fmt.Errorf("log level %q: %w", level, err)
 	}
-
-	var cfg zap.Config
-	if format == "json" {
-		cfg = zap.NewProductionConfig()
-	} else {
+	cfg := zap.NewProductionConfig()
+	if format == "console" {
 		cfg = zap.NewDevelopmentConfig()
 	}
-
 	cfg.Level = zap.NewAtomicLevelAt(lvl)
-	cfg.DisableStacktrace = true
-
-	logger, _ := cfg.Build()
-	return logger
+	cfg.EncoderConfig.EncodeTime = zapcore.ISO8601TimeEncoder
+	logger, err := cfg.Build()
+	if err != nil {
+		return nil, fmt.Errorf("building logger: %w", err)
+	}
+	return logger, nil
 }

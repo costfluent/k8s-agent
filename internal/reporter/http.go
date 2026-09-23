@@ -1,232 +1,144 @@
+// Package reporter posts buffered reports to POST {endpoint}/v1/kubernetes/reports.
 package reporter
 
 import (
 	"bytes"
-	"compress/gzip"
 	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
+	"strings"
 	"time"
 
-	"go.uber.org/zap"
-
 	v1 "github.com/costfluent/k8s-agent/api/v1"
-	"github.com/costfluent/k8s-agent/internal/config"
-	"github.com/costfluent/k8s-agent/internal/metrics"
 )
 
 const (
-	userAgent         = "costfluent-k8s-agent"
-	reportEndpoint    = "/api/internal/k8s/report"
-	heartbeatEndpoint = "/api/internal/k8s/heartbeat"
-	maxRetries        = 5
+	reportsPath    = "/v1/kubernetes/reports"
+	requestTimeout = 30 * time.Second
+	maxErrorBody   = 64 << 10
 )
 
-// HTTPReporter sends reports to Costfluent API
-type HTTPReporter struct {
-	client   *http.Client
-	cfg      *config.Config
-	logger   *zap.Logger
-	version  string
-	retryDelay time.Duration
+// Outcome is what the sender does with a report after one attempt.
+type Outcome int
+
+const (
+	// Accepted: the API stored the report; remove it.
+	Accepted Outcome = iota
+	// Rejected: the API refused this report for good (400, 409, 410); remove it.
+	Rejected
+	// Unauthorized: the token is wrong or lacks the capability (401, 403). Keep the report and stop
+	// sending until the agent restarts with a fixed token.
+	Unauthorized
+	// Retry: a transient failure (network, 413, 429, 5xx); keep the report and back off.
+	Retry
+)
+
+// Result is one attempt's outcome and what the API said.
+type Result struct {
+	Outcome Outcome
+	Status  int
+	Message string
+	ID      string
 }
 
-// NewHTTPReporter creates a new HTTP reporter
-func NewHTTPReporter(cfg *config.Config, version string, logger *zap.Logger) *HTTPReporter {
-	return &HTTPReporter{
-		client: &http.Client{
-			Timeout: 30 * time.Second,
-		},
-		cfg:        cfg,
-		logger:     logger.Named("reporter"),
-		version:    version,
-		retryDelay: time.Second,
+// Client sends reports.
+type Client struct {
+	url       string
+	token     string
+	userAgent string
+	http      *http.Client
+}
+
+// NewClient builds a client for endpoint. proxy, when set, carries only report traffic; otherwise
+// the standard proxy environment variables apply.
+func NewClient(endpoint *url.URL, token, version string, proxy *url.URL) *Client {
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	if proxy != nil {
+		transport.Proxy = http.ProxyURL(proxy)
+	}
+	return &Client{
+		url:       strings.TrimRight(endpoint.String(), "/") + reportsPath,
+		token:     token,
+		userAgent: "costfluent-k8s-agent/" + version,
+		http:      &http.Client{Transport: transport, Timeout: requestTimeout},
 	}
 }
 
-// SendReport sends a metrics report to the API
-func (r *HTTPReporter) SendReport(ctx context.Context, report *v1.MetricsReport) error {
-	start := time.Now()
-
-	// Compress the payload
-	payload, err := r.compressPayload(report)
+// Send posts one gzip report body.
+func (c *Client) Send(ctx context.Context, gzipBody []byte) Result {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.url, bytes.NewReader(gzipBody))
 	if err != nil {
-		return fmt.Errorf("compressing payload: %w", err)
+		return Result{Outcome: Retry, Message: fmt.Sprintf("building request: %v", err)}
 	}
-
-	r.logger.Info("sending report",
-		zap.Int("nodes", len(report.Nodes)),
-		zap.Int("pods", len(report.PodMetrics)),
-		zap.Int("compressed_bytes", len(payload)),
-		zap.Time("report_start", report.ReportStart),
-		zap.Time("report_end", report.ReportEnd))
-
-	// Send with retries
-	var lastErr error
-	for attempt := 1; attempt <= maxRetries; attempt++ {
-		err := r.doSendReport(ctx, payload)
-		if err == nil {
-			r.logger.Info("report sent successfully")
-			metrics.RecordReport(true, time.Since(start).Seconds(), len(payload))
-			return nil
-		}
-
-		lastErr = err
-		r.logger.Warn("report send failed",
-			zap.Int("attempt", attempt),
-			zap.Error(err))
-
-		if attempt < maxRetries {
-			delay := r.retryDelay * time.Duration(1<<(attempt-1)) // Exponential backoff
-			if delay > 30*time.Second {
-				delay = 30 * time.Second
-			}
-
-			select {
-			case <-ctx.Done():
-				metrics.RecordReport(false, time.Since(start).Seconds(), len(payload))
-				return ctx.Err()
-			case <-time.After(delay):
-			}
-		}
-	}
-
-	metrics.RecordReport(false, time.Since(start).Seconds(), len(payload))
-	return fmt.Errorf("failed after %d attempts: %w", maxRetries, lastErr)
-}
-
-func (r *HTTPReporter) doSendReport(ctx context.Context, payload []byte) error {
-	url := r.cfg.APIEndpoint + reportEndpoint
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(payload))
-	if err != nil {
-		return fmt.Errorf("creating request: %w", err)
-	}
-
-	r.setHeaders(req)
-	req.Header.Set("Content-Encoding", "gzip")
-
-	resp, err := r.client.Do(req)
-	if err != nil {
-		return fmt.Errorf("sending request: %w", err)
-	}
-	defer resp.Body.Close()
-
-	body, _ := io.ReadAll(resp.Body)
-
-	if resp.StatusCode == http.StatusAccepted || resp.StatusCode == http.StatusOK {
-		return nil
-	}
-
-	if resp.StatusCode == http.StatusUnauthorized {
-		return fmt.Errorf("unauthorized: invalid or expired token")
-	}
-
-	if resp.StatusCode == http.StatusTooManyRequests {
-		return fmt.Errorf("rate limited, retry later")
-	}
-
-	if resp.StatusCode >= 500 {
-		return fmt.Errorf("server error %d: %s", resp.StatusCode, string(body))
-	}
-
-	return fmt.Errorf("unexpected status %d: %s", resp.StatusCode, string(body))
-}
-
-// SendHeartbeat sends a lightweight health check
-func (r *HTTPReporter) SendHeartbeat(ctx context.Context, nodeCount, podCount int) error {
-	heartbeat := &v1.Heartbeat{
-		ClusterID:    r.cfg.ClusterID,
-		AgentVersion: r.version,
-		NodeCount:    nodeCount,
-		PodCount:     podCount,
-	}
-
-	payload, err := json.Marshal(heartbeat)
-	if err != nil {
-		return fmt.Errorf("marshaling heartbeat: %w", err)
-	}
-
-	url := r.cfg.APIEndpoint + heartbeatEndpoint
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(payload))
-	if err != nil {
-		return fmt.Errorf("creating request: %w", err)
-	}
-
-	r.setHeaders(req)
-
-	resp, err := r.client.Do(req)
-	if err != nil {
-		return fmt.Errorf("sending heartbeat: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusAccepted {
-		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("heartbeat failed with status %d: %s", resp.StatusCode, string(body))
-	}
-
-	r.logger.Debug("heartbeat sent",
-		zap.Int("nodes", nodeCount),
-		zap.Int("pods", podCount))
-
-	return nil
-}
-
-func (r *HTTPReporter) setHeaders(req *http.Request) {
+	req.Header.Set("Authorization", "Bearer "+c.token)
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+r.cfg.Token)
-	req.Header.Set("User-Agent", fmt.Sprintf("%s/%s", userAgent, r.version))
-	req.Header.Set("X-Agent-Version", r.version)
-	req.Header.Set("X-Cluster-ID", r.cfg.ClusterID)
+	req.Header.Set("Content-Encoding", "gzip")
+	req.Header.Set("User-Agent", c.userAgent)
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return Result{Outcome: Retry, Message: fmt.Sprintf("POST %s: %v", c.url, err)}
+	}
+	defer func() { _ = resp.Body.Close() }()
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, maxErrorBody))
+
+	res := Result{Status: resp.StatusCode}
+	switch s := resp.StatusCode; {
+	case s >= 200 && s < 300:
+		res.Outcome = Accepted
+		var accepted v1.ReportAccepted
+		if json.Unmarshal(body, &accepted) == nil {
+			res.ID = accepted.ID
+		}
+		return res
+	case s == http.StatusUnauthorized || s == http.StatusForbidden:
+		res.Outcome = Unauthorized
+	case s == http.StatusBadRequest || s == http.StatusConflict || s == http.StatusGone:
+		res.Outcome = Rejected
+	default:
+		res.Outcome = Retry
+	}
+	res.Message = problemMessage(body)
+	return res
 }
 
-func (r *HTTPReporter) compressPayload(report *v1.MetricsReport) ([]byte, error) {
-	data, err := json.Marshal(report)
-	if err != nil {
-		return nil, fmt.Errorf("marshaling report: %w", err)
+func problemMessage(body []byte) string {
+	var p v1.Problem
+	if json.Unmarshal(body, &p) == nil && (p.Title != "" || p.Detail != "") {
+		if p.Detail == "" {
+			return p.Title
+		}
+		if p.Title == "" {
+			return p.Detail
+		}
+		return p.Title + ": " + p.Detail
 	}
-
-	var buf bytes.Buffer
-	gz := gzip.NewWriter(&buf)
-
-	if _, err := gz.Write(data); err != nil {
-		return nil, fmt.Errorf("gzip write: %w", err)
+	text := strings.TrimSpace(string(body))
+	if len(text) > 300 {
+		text = text[:300]
 	}
-
-	if err := gz.Close(); err != nil {
-		return nil, fmt.Errorf("gzip close: %w", err)
-	}
-
-	r.logger.Debug("compressed payload",
-		zap.Int("original", len(data)),
-		zap.Int("compressed", buf.Len()),
-		zap.Float64("ratio", float64(buf.Len())/float64(len(data))))
-
-	return buf.Bytes(), nil
+	return text
 }
 
-// HealthCheck verifies connectivity to the API
-func (r *HTTPReporter) HealthCheck(ctx context.Context) error {
-	url := r.cfg.APIEndpoint + "/health"
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-	if err != nil {
-		return err
+// Advice is the log line's next step for a refusal.
+func Advice(status int) string {
+	switch status {
+	case http.StatusUnauthorized:
+		return "the token is not valid: create an organization API token, update agent.token (or the secret in agent.secret), and restart the agent; buffered reports are kept and sent then"
+	case http.StatusForbidden:
+		return "the token lacks the Report Kubernetes usage capability, or is a workspace token: use an organization API token with that capability and restart the agent; buffered reports are kept and sent then"
+	case http.StatusConflict:
+		return "another agent instance reports this cluster ID for an overlapping window, or the organization reached its cluster limit: run one agent per cluster, with a unique agent.clusterID"
+	case http.StatusGone:
+		return "this cluster was deleted in Costfluent: install with a new agent.clusterID to report it again"
+	case http.StatusBadRequest:
+		return "the API refused the report as invalid; upgrade the agent, and contact support if it persists"
+	case http.StatusRequestEntityTooLarge:
+		return "the report is larger than the API accepts; retrying with backoff"
+	default:
+		return "retrying with backoff"
 	}
-
-	resp, err := r.client.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("health check failed: %d", resp.StatusCode)
-	}
-
-	return nil
 }

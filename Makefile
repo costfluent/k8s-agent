@@ -1,4 +1,4 @@
-.PHONY: build test lint fmt vet clean docker run help
+.PHONY: build test check-test e2e lint fmt fmt-check vet check clean docker run help
 
 # Build variables
 BINARY_NAME := costfluent-k8s-agent
@@ -9,7 +9,9 @@ LDFLAGS := -ldflags "-s -w -X main.Version=$(VERSION) -X main.GitCommit=$(GIT_CO
 
 # Go variables
 GOBIN := $(shell go env GOPATH)/bin
-GOLANGCI_LINT := $(GOBIN)/golangci-lint
+GOLANGCI_LINT_VERSION := v2.4.0
+GOLANGCI_LINT_TOOLCHAIN := go1.24.10
+GOLANGCI_LINT := $(GOBIN)/golangci-lint-$(GOLANGCI_LINT_VERSION)
 
 # Docker variables
 DOCKER_REGISTRY ?= ghcr.io/costfluent
@@ -39,15 +41,22 @@ coverage: test
 
 ## lint: Run linter
 lint: $(GOLANGCI_LINT)
-	$(GOLANGCI_LINT) run ./...
+	GOTOOLCHAIN=$(GOLANGCI_LINT_TOOLCHAIN) $(GOLANGCI_LINT) run ./...
 
 $(GOLANGCI_LINT):
-	go install github.com/golangci/golangci-lint/cmd/golangci-lint@latest
+	@mkdir -p $(dir $(GOLANGCI_LINT)); \
+		tmp=$$(mktemp -d); trap 'rm -rf "$$tmp"' EXIT; \
+		GOTOOLCHAIN=$(GOLANGCI_LINT_TOOLCHAIN) GOBIN="$$tmp" go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@$(GOLANGCI_LINT_VERSION); \
+		mv "$$tmp/golangci-lint" $(GOLANGCI_LINT)
 
 ## fmt: Format code
 fmt:
 	go fmt ./...
 	gofmt -s -w .
+
+## fmt-check: Fail when Go source is not formatted, without rewriting it
+fmt-check:
+	@test -z "$$(gofmt -s -l .)" || { gofmt -s -l .; exit 1; }
 
 ## vet: Run go vet
 vet:
@@ -89,8 +98,17 @@ deps:
 generate:
 	go generate ./...
 
-## check: Run all checks (fmt, vet, lint, test)
-check: fmt vet lint test
+## check-test: Run tests without leaving a coverage file
+check-test:
+	go test -race ./...
+
+## e2e: Install the chart into a kind cluster and assert a report reaches a stub receiver (needs docker, kind, kubectl, helm; not part of check)
+e2e:
+	go test -tags e2e -count=1 -timeout 15m -v ./test/e2e/
+
+## check: Run non-mutating build, format, vet, lint, and tests
+check: fmt-check vet lint check-test
+	go build ./...
 
 ## version: Print version info
 version:

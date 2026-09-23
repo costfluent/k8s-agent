@@ -1,11 +1,18 @@
+// Package storage keeps closed reports on disk until the API accepts them, and the agent's
+// persistent identity.
 package storage
 
 import (
+	"bytes"
+	"compress/gzip"
+	"crypto/rand"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -16,288 +23,217 @@ import (
 )
 
 const (
-	maxBufferSize    = 50 * 1024 * 1024 // 50MB max buffer
-	maxBufferAge     = 24 * time.Hour
-	stateFileName    = "state.json"
-	reportsDir       = "pending"
+	DefaultMaxAge   = 96 * time.Hour
+	DefaultMaxBytes = 50 << 20
+
+	bufferDir      = "buffer"
+	suffix         = ".json.gz"
+	nameTimeLayout = "20060102T150405Z"
+	instanceIDFile = "instance-id"
 )
 
-// Buffer provides persistent storage for pending reports
+// Entry is one buffered report, already gzip-encoded for the wire.
+type Entry struct {
+	Name        string
+	WindowStart time.Time
+	Body        []byte
+}
+
+// Buffer is a directory of gzip reports, named so that lexical order is window order.
 type Buffer struct {
-	mu      sync.RWMutex
-	dataDir string
-	logger  *zap.Logger
+	dir      string
+	maxAge   time.Duration
+	maxBytes int64
+	now      func() time.Time
+	logger   *zap.Logger
+	mu       sync.Mutex
 }
 
-// State tracks agent state for recovery
-type State struct {
-	LastReportTime    time.Time `json:"last_report_time"`
-	LastHeartbeatTime time.Time `json:"last_heartbeat_time"`
-	PendingReportIDs  []string  `json:"pending_report_ids"`
-}
-
-// NewBuffer creates a new persistent buffer
-func NewBuffer(dataDir string, logger *zap.Logger) (*Buffer, error) {
-	reportsPath := filepath.Join(dataDir, reportsDir)
-	if err := os.MkdirAll(reportsPath, 0755); err != nil {
-		return nil, fmt.Errorf("creating buffer directory: %w", err)
+// Open prepares dataDir/buffer and fails when the directory cannot be written, so a read-only or
+// unmounted volume is an error at start rather than a silent loss an hour later.
+func Open(dataDir string, logger *zap.Logger) (*Buffer, error) {
+	dir := filepath.Join(dataDir, bufferDir)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return nil, fmt.Errorf("data directory %s is not writable: %w", dataDir, err)
 	}
-
-	return &Buffer{
-		dataDir: dataDir,
-		logger:  logger.Named("buffer"),
-	}, nil
-}
-
-// SaveReport persists a report to disk
-func (b *Buffer) SaveReport(report *v1.MetricsReport) (string, error) {
+	probe, err := os.CreateTemp(dir, ".probe-*")
+	if err != nil {
+		return nil, fmt.Errorf("data directory %s is not writable: %w", dataDir, err)
+	}
+	_ = probe.Close()
+	if err := os.Remove(probe.Name()); err != nil {
+		return nil, fmt.Errorf("data directory %s: removing probe: %w", dataDir, err)
+	}
+	b := &Buffer{dir: dir, maxAge: DefaultMaxAge, maxBytes: DefaultMaxBytes, now: time.Now, logger: logger.Named("buffer")}
 	b.mu.Lock()
 	defer b.mu.Unlock()
-
-	// Generate unique ID based on timestamp
-	reportID := fmt.Sprintf("report_%d", report.ReportEnd.UnixNano())
-	filename := filepath.Join(b.dataDir, reportsDir, reportID+".json")
-
-	data, err := json.Marshal(report)
-	if err != nil {
-		return "", fmt.Errorf("marshaling report: %w", err)
+	if err := b.enforceLocked(); err != nil {
+		return nil, err
 	}
-
-	// Check buffer size limits
-	if err := b.enforceBufferLimits(int64(len(data))); err != nil {
-		b.logger.Warn("buffer limit exceeded, dropping oldest reports", zap.Error(err))
-	}
-
-	if err := os.WriteFile(filename, data, 0644); err != nil {
-		return "", fmt.Errorf("writing report: %w", err)
-	}
-
-	b.logger.Debug("saved report to buffer",
-		zap.String("id", reportID),
-		zap.Int("bytes", len(data)))
-
-	return reportID, nil
+	return b, nil
 }
 
-// LoadReport reads a report from disk
-func (b *Buffer) LoadReport(reportID string) (*v1.MetricsReport, error) {
-	b.mu.RLock()
-	defer b.mu.RUnlock()
-
-	filename := filepath.Join(b.dataDir, reportsDir, reportID+".json")
-
-	data, err := os.ReadFile(filename)
-	if err != nil {
-		return nil, fmt.Errorf("reading report: %w", err)
-	}
-
-	var report v1.MetricsReport
-	if err := json.Unmarshal(data, &report); err != nil {
-		return nil, fmt.Errorf("unmarshaling report: %w", err)
-	}
-
-	return &report, nil
-}
-
-// DeleteReport removes a report from disk
-func (b *Buffer) DeleteReport(reportID string) error {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-
-	filename := filepath.Join(b.dataDir, reportsDir, reportID+".json")
-
-	if err := os.Remove(filename); err != nil && !os.IsNotExist(err) {
-		return fmt.Errorf("deleting report: %w", err)
-	}
-
-	b.logger.Debug("deleted report from buffer", zap.String("id", reportID))
-	return nil
-}
-
-// ListPendingReports returns IDs of all buffered reports
-func (b *Buffer) ListPendingReports() ([]string, error) {
-	b.mu.RLock()
-	defer b.mu.RUnlock()
-
-	reportsPath := filepath.Join(b.dataDir, reportsDir)
-
-	entries, err := os.ReadDir(reportsPath)
-	if err != nil {
-		return nil, fmt.Errorf("reading reports directory: %w", err)
-	}
-
-	var ids []string
-	for _, entry := range entries {
-		if entry.IsDir() {
-			continue
-		}
-		name := entry.Name()
-		if filepath.Ext(name) == ".json" {
-			ids = append(ids, name[:len(name)-5]) // Remove .json extension
-		}
-	}
-
-	// Sort by timestamp (oldest first)
-	sort.Strings(ids)
-
-	return ids, nil
-}
-
-// SaveState persists agent state
-func (b *Buffer) SaveState(state *State) error {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-
-	filename := filepath.Join(b.dataDir, stateFileName)
-
-	data, err := json.MarshalIndent(state, "", "  ")
-	if err != nil {
-		return fmt.Errorf("marshaling state: %w", err)
-	}
-
-	if err := os.WriteFile(filename, data, 0644); err != nil {
-		return fmt.Errorf("writing state: %w", err)
-	}
-
-	return nil
-}
-
-// LoadState reads persisted agent state
-func (b *Buffer) LoadState() (*State, error) {
-	b.mu.RLock()
-	defer b.mu.RUnlock()
-
-	filename := filepath.Join(b.dataDir, stateFileName)
-
-	data, err := os.ReadFile(filename)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return &State{}, nil
-		}
-		return nil, fmt.Errorf("reading state: %w", err)
-	}
-
-	var state State
-	if err := json.Unmarshal(data, &state); err != nil {
-		return nil, fmt.Errorf("unmarshaling state: %w", err)
-	}
-
-	return &state, nil
-}
-
-// enforceBufferLimits removes old reports if buffer is too large
-func (b *Buffer) enforceBufferLimits(newReportSize int64) error {
-	reportsPath := filepath.Join(b.dataDir, reportsDir)
-
-	entries, err := os.ReadDir(reportsPath)
+// Put stores a closed report and then drops the oldest reports beyond the caps.
+func (b *Buffer) Put(r v1.Report) error {
+	body, err := Encode(r)
 	if err != nil {
 		return err
 	}
-
-	// Calculate total size
-	var totalSize int64
-	var files []struct {
-		name    string
-		size    int64
-		modTime time.Time
+	name := r.WindowStart.UTC().Format(nameTimeLayout) + "_" + r.WindowEnd.UTC().Format(nameTimeLayout) + suffix
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	tmp := filepath.Join(b.dir, "."+name+".tmp")
+	if err := os.WriteFile(tmp, body, 0o600); err != nil {
+		return fmt.Errorf("buffering report %s: %w", name, err)
 	}
+	if err := os.Rename(tmp, filepath.Join(b.dir, name)); err != nil {
+		return fmt.Errorf("buffering report %s: %w", name, err)
+	}
+	return b.enforceLocked()
+}
 
-	for _, entry := range entries {
-		if entry.IsDir() {
+// Encode is the wire body: gzip JSON.
+func Encode(r v1.Report) ([]byte, error) {
+	var buf bytes.Buffer
+	zw := gzip.NewWriter(&buf)
+	if err := json.NewEncoder(zw).Encode(r); err != nil {
+		return nil, fmt.Errorf("encoding report: %w", err)
+	}
+	if err := zw.Close(); err != nil {
+		return nil, fmt.Errorf("compressing report: %w", err)
+	}
+	return buf.Bytes(), nil
+}
+
+// Oldest returns the earliest buffered report.
+func (b *Buffer) Oldest() (Entry, bool, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	files, err := b.listLocked()
+	if err != nil || len(files) == 0 {
+		return Entry{}, false, err
+	}
+	f := files[0]
+	body, err := os.ReadFile(filepath.Join(b.dir, f.name))
+	if err != nil {
+		return Entry{}, false, fmt.Errorf("reading buffered report %s: %w", f.name, err)
+	}
+	return Entry{Name: f.name, WindowStart: f.start, Body: body}, true, nil
+}
+
+// Remove deletes a sent or refused report.
+func (b *Buffer) Remove(name string) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if err := os.Remove(filepath.Join(b.dir, name)); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("removing buffered report %s: %w", name, err)
+	}
+	return b.enforceLocked()
+}
+
+// Len returns the number of buffered reports.
+func (b *Buffer) Len() (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	files, err := b.listLocked()
+	return len(files), err
+}
+
+type file struct {
+	name  string
+	start time.Time
+	size  int64
+}
+
+func (b *Buffer) listLocked() ([]file, error) {
+	entries, err := os.ReadDir(b.dir)
+	if err != nil {
+		return nil, fmt.Errorf("listing buffer: %w", err)
+	}
+	var files []file
+	for _, e := range entries {
+		name := e.Name()
+		if e.IsDir() || !strings.HasSuffix(name, suffix) || strings.HasPrefix(name, ".") {
 			continue
 		}
-		info, err := entry.Info()
+		start, err := time.Parse(nameTimeLayout, strings.SplitN(name, "_", 2)[0])
 		if err != nil {
+			b.logger.Warn("ignoring a buffer file with an unexpected name", zap.String("file", name))
 			continue
 		}
-		totalSize += info.Size()
-		files = append(files, struct {
-			name    string
-			size    int64
-			modTime time.Time
-		}{
-			name:    entry.Name(),
-			size:    info.Size(),
-			modTime: info.ModTime(),
-		})
-	}
-
-	// If adding new report would exceed limit, remove oldest
-	if totalSize+newReportSize > maxBufferSize {
-		// Sort by modification time (oldest first)
-		sort.Slice(files, func(i, j int) bool {
-			return files[i].modTime.Before(files[j].modTime)
-		})
-
-		// Remove files until we have space
-		for _, f := range files {
-			if totalSize+newReportSize <= maxBufferSize {
-				break
-			}
-
-			filename := filepath.Join(reportsPath, f.name)
-			if err := os.Remove(filename); err != nil {
-				continue
-			}
-
-			totalSize -= f.size
-			b.logger.Warn("removed old report due to buffer limit",
-				zap.String("file", f.name),
-				zap.Int64("freed_bytes", f.size))
+		info, err := e.Info()
+		if err != nil {
+			return nil, fmt.Errorf("reading buffer entry %s: %w", name, err)
 		}
+		files = append(files, file{name: name, start: start, size: info.Size()})
 	}
+	sort.Slice(files, func(i, j int) bool { return files[i].name < files[j].name })
+	return files, nil
+}
 
-	// Also remove reports older than maxBufferAge
-	cutoff := time.Now().Add(-maxBufferAge)
+func (b *Buffer) enforceLocked() error {
+	files, err := b.listLocked()
+	if err != nil {
+		return err
+	}
+	var total int64
 	for _, f := range files {
-		if f.modTime.Before(cutoff) {
-			filename := filepath.Join(reportsPath, f.name)
-			if err := os.Remove(filename); err != nil {
-				continue
-			}
-			b.logger.Warn("removed expired report",
-				zap.String("file", f.name),
-				zap.Time("modTime", f.modTime))
-		}
+		total += f.size
 	}
-
+	cutoff := b.now().Add(-b.maxAge)
+	for len(files) > 0 {
+		f := files[0]
+		reason := ""
+		switch {
+		case f.start.Before(cutoff):
+			reason = "age"
+		case total > b.maxBytes:
+			reason = "size"
+		}
+		if reason == "" {
+			break
+		}
+		if err := os.Remove(filepath.Join(b.dir, f.name)); err != nil {
+			return fmt.Errorf("dropping buffered report %s: %w", f.name, err)
+		}
+		metrics.BufferDropped.WithLabelValues(reason).Inc()
+		b.logger.Warn("dropped the oldest buffered report", zap.String("file", f.name), zap.String("reason", reason))
+		total -= f.size
+		files = files[1:]
+	}
+	metrics.BufferReports.Set(float64(len(files)))
+	metrics.BufferBytes.Set(float64(total))
 	return nil
 }
 
-// BufferStats returns buffer statistics
-func (b *Buffer) BufferStats() (count int, totalBytes int64, oldestTime time.Time) {
-	b.mu.RLock()
-	defer b.mu.RUnlock()
-
-	reportsPath := filepath.Join(b.dataDir, reportsDir)
-
-	entries, err := os.ReadDir(reportsPath)
+// InstanceID returns the UUID in dataDir/instance-id, creating it on first use. It names this
+// agent installation to the API, which refuses a second instance reporting the same cluster.
+func InstanceID(dataDir string) (string, error) {
+	path := filepath.Join(dataDir, instanceIDFile)
+	data, err := os.ReadFile(path)
+	if err == nil {
+		if id := strings.TrimSpace(string(data)); id != "" {
+			return id, nil
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return "", fmt.Errorf("reading %s: %w", path, err)
+	}
+	id, err := newUUID()
 	if err != nil {
-		return 0, 0, time.Time{}
+		return "", err
 	}
-
-	for _, entry := range entries {
-		if entry.IsDir() {
-			continue
-		}
-		info, err := entry.Info()
-		if err != nil {
-			continue
-		}
-
-		count++
-		totalBytes += info.Size()
-
-		if oldestTime.IsZero() || info.ModTime().Before(oldestTime) {
-			oldestTime = info.ModTime()
-		}
+	if err := os.WriteFile(path, []byte(id+"\n"), 0o600); err != nil {
+		return "", fmt.Errorf("writing %s: %w", path, err)
 	}
-
-	return count, totalBytes, oldestTime
+	return id, nil
 }
 
-// UpdateMetrics updates prometheus metrics for buffer state
-func (b *Buffer) UpdateMetrics() {
-	count, totalBytes, _ := b.BufferStats()
-	metrics.UpdateBuffer(count, totalBytes)
+func newUUID() (string, error) {
+	var u [16]byte
+	if _, err := rand.Read(u[:]); err != nil {
+		return "", fmt.Errorf("generating instance id: %w", err)
+	}
+	u[6] = (u[6] & 0x0f) | 0x40
+	u[8] = (u[8] & 0x3f) | 0x80
+	return fmt.Sprintf("%x-%x-%x-%x-%x", u[0:4], u[4:6], u[6:8], u[8:10], u[10:16]), nil
 }

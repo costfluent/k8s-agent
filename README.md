@@ -1,278 +1,78 @@
-# Costfluent Kubernetes Agent
+# Costfluent Kubernetes agent
 
-Lightweight in-cluster agent that collects container metrics and reports to Costfluent for cost allocation.
+The in-cluster agent that reports a Kubernetes cluster's resource usage to Costfluent, which
+allocates the cost of the cluster's nodes to namespaces, workloads and labels. Install it with the
+[Helm chart](https://github.com/costfluent/helm-charts/tree/main/costfluent-k8s-agent); the guide
+is at <https://docs.costfluent.com/connect/kubernetes>.
 
-## Architecture
+## How it works
 
-```
-┌─────────────────────────────────────────────────────────────┐
-│                    Kubernetes Cluster                        │
-│  ┌──────────────────────┐                                   │
-│  │  Costfluent Agent     │  StatefulSet (1 replica)          │
-│  │  ┌────────────────┐  │                                   │
-│  │  │ Scraper        │──┼──► metrics-server (all nodes)     │
-│  │  │ (every 60s)    │  │                                   │
-│  │  └────────────────┘  │                                   │
-│  │  ┌────────────────┐  │                                   │
-│  │  │ Metadata       │──┼──► kube-apiserver (pods, nodes)   │
-│  │  │ Collector      │  │                                   │
-│  │  └────────────────┘  │                                   │
-│  │  ┌────────────────┐  │                                   │
-│  │  │ Reporter       │──┼──► Costfluent API (hourly)         │
-│  │  └────────────────┘  │                                   │
-│  │  ┌────────────────┐  │                                   │
-│  │  │ PV Buffer      │  │  Crash recovery, offline buffer   │
-│  │  └────────────────┘  │                                   │
-│  └──────────────────────┘                                   │
-└─────────────────────────────────────────────────────────────┘
-```
+One replica, run as a StatefulSet:
 
-## Features
+1. Every polling interval it lists nodes and pods from the API server and reads each kubelet's
+   `/metrics/resource` endpoint on port 10250 with its service-account token (RBAC
+   `nodes/metrics get`), ten nodes at a time. No metrics-server is needed.
+2. It integrates container CPU and memory usage, and max(request, usage), over the window in
+   memory, and snapshots the open window to the data directory every five minutes so a restart
+   does not lose it.
+3. When a window closes (each UTC clock hour, plus a first window about two minutes after start) it
+   buffers the report on the data directory and posts it, gzip JSON with a bearer token, to
+   `POST {endpoint}/v1/kubernetes/reports`. The buffer keeps undelivered reports for 96 hours or
+   50 MB, oldest dropped first.
 
-- Container CPU/memory metrics collection via metrics-server
-- Pod metadata (labels, annotations, controller info)
-- Node capacity and pricing info
-- Spot/preemptible instance detection
-- On-prem pricing via node annotations
-- Hourly batch reporting with gzip compression
-- PV-backed buffer for offline resilience
-- Prometheus metrics endpoint
-
-## Requirements
-
-- Kubernetes 1.24+
-- metrics-server installed
-- Network access to Costfluent API
+`api/v1/report.go` is the whole wire contract, and `api/v1/testdata/report.json` is a golden
+report. The chart README's table of what the agent reads and sends is kept in step with it.
 
 ## Configuration
 
-| Environment Variable | Description | Default |
-|---------------------|-------------|---------|
-| `COSTFLUENT_TOKEN` | API token (required) | - |
-| `COSTFLUENT_CLUSTER_ID` | Cluster identifier (required) | - |
-| `COSTFLUENT_CLUSTER_NAME` | Display name | - |
-| `COSTFLUENT_API_ENDPOINT` | API URL | `https://api.costfluent.com` |
-| `COSTFLUENT_POLLING_INTERVAL` | Scrape interval | `60s` |
-| `COSTFLUENT_REPORTING_INTERVAL` | Report interval | `3600s` |
-| `COSTFLUENT_HEARTBEAT_INTERVAL` | Heartbeat interval | `300s` |
-| `COSTFLUENT_NAMESPACE_EXCLUDE` | Excluded namespaces | `kube-system,kube-public` |
-| `COSTFLUENT_LOG_LEVEL` | Log level | `info` |
-| `COSTFLUENT_LOG_FORMAT` | Log format (json/console) | `json` |
-| `COSTFLUENT_DATA_DIR` | Buffer directory | `/data` |
-| `COSTFLUENT_METRICS_PORT` | Prometheus port | `9010` |
+Environment variables only; the chart sets each from an `agent.*` value.
 
-## Building
+| Variable | Chart value | Default | Meaning |
+|---|---|---|---|
+| `COSTFLUENT_TOKEN` | `agent.token` or `agent.secret.*` | required | Organization API token with the Report Kubernetes usage capability. |
+| `COSTFLUENT_CLUSTER_ID` | `agent.clusterID` | required | The cluster's ID: `^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$`. |
+| `COSTFLUENT_API_ENDPOINT` | `agent.apiEndpoint` | `https://api.costfluent.com` | `http://` is accepted with a warning, for a local receiver. |
+| `COSTFLUENT_POLLING_INTERVAL` | `agent.pollingInterval` | `60` | Seconds between polls: 5, 10, 15, 30 or 60. |
+| `COSTFLUENT_NODE_ADDRESS_TYPES` | `agent.nodeAddressTypes` | `InternalIP,InternalDNS,Hostname,ExternalIP,ExternalDNS` | Node address types tried, in order, to reach each kubelet. |
+| `COSTFLUENT_KUBE_SKIP_TLS_VERIFY` | `agent.disableKubeTLSverify` | `false` | Skip verifying kubelet serving certificates. |
+| `COSTFLUENT_ALLOWED_LABELS` | `agent.allowedLabels` | empty: every pod label | Comma-separated pod label keys to send. |
+| `COSTFLUENT_ALLOWED_ANNOTATIONS` | `agent.allowedAnnotations` | empty: none | Comma-separated pod annotation keys to send, at most 10; values are cut to 100 characters. |
+| `COSTFLUENT_COLLECT_NAMESPACE_LABELS` | `agent.collectNamespaceLabels` | `false` | Send namespace labels. |
+| `COSTFLUENT_REPORT_HTTP_PROXY` | `agent.reportHTTPProxy` | none | HTTP proxy for report traffic only. |
+| `COSTFLUENT_DATA_DIR` | `persist.mountPath` | `/data` (the chart sets `/var/lib/costfluent`) | Buffer, window snapshot and instance ID. Must be writable; the agent exits otherwise. |
+| `COSTFLUENT_METRICS_PORT` | `service.port` | `9010` | Serves `/metrics`, `/healthz` and `/readyz`. |
+| `COSTFLUENT_LOG_LEVEL` | `agent.logLevel` | `info` | `debug`, `info`, `warn` or `error`. |
+| `COSTFLUENT_LOG_FORMAT` | `agent.extraEnv` | `json` | `json` or `console`. |
 
-### Prerequisites
+## Metrics and health
 
-- Go 1.23+
-- Docker (for container builds)
-- golangci-lint (for linting)
+`/healthz` answers once the process runs; `/readyz` once the first poll has completed. `/metrics`
+serves:
 
-### Using Makefile
-
-```bash
-make build          # Build binary to bin/
-make test           # Run tests with race detector
-make lint           # Run golangci-lint
-make docker         # Build Docker image
-make check          # Run all checks (fmt, vet, lint, test)
-make help           # Show all targets
-```
-
-### Manual Build
-
-```bash
-# Build binary
-CGO_ENABLED=0 go build -o bin/costfluent-k8s-agent ./cmd/agent
-
-# Build with version info
-CGO_ENABLED=0 go build \
-  -ldflags "-s -w -X main.Version=1.0.0 -X main.GitCommit=$(git rev-parse --short HEAD)" \
-  -o bin/costfluent-k8s-agent ./cmd/agent
-
-# Cross-compile for Linux
-CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o bin/costfluent-k8s-agent-linux ./cmd/agent
-```
-
-### Docker Build
-
-```bash
-# Build image
-docker build -t ghcr.io/costfluent/k8s-agent:latest .
-
-# Build with version
-docker build \
-  --build-arg VERSION=1.0.0 \
-  --build-arg GIT_COMMIT=$(git rev-parse --short HEAD) \
-  --build-arg BUILD_TIME=$(date -u +%Y-%m-%dT%H:%M:%SZ) \
-  -t ghcr.io/costfluent/k8s-agent:1.0.0 .
-
-# Push to registry
-docker push ghcr.io/costfluent/k8s-agent:1.0.0
-```
+| Metric | Labels | Meaning |
+|---|---|---|
+| `costfluent_agent_info` | `version`, `cluster_id` | Always 1. |
+| `costfluent_agent_node_scrape_total` | `result` (`ok`, `error`) | Kubelet scrapes. |
+| `costfluent_agent_poll_duration_seconds` | | One poll across every node. |
+| `costfluent_agent_reports_total` | `result` (`accepted`, `rejected`, `unauthorized`, `retry`) | Report submissions. |
+| `costfluent_agent_report_bytes` | | Gzip report body size. |
+| `costfluent_agent_buffer_reports`, `costfluent_agent_buffer_bytes` | | Reports waiting in the buffer. |
+| `costfluent_agent_buffer_dropped_total` | `reason` (`age`, `size`, `rejected`) | Reports dropped from the buffer. |
 
 ## Development
 
 ```bash
-# Install dependencies
-go mod tidy
-
-# Run locally (requires kubeconfig or in-cluster)
-export COSTFLUENT_TOKEN=dev_token
-export COSTFLUENT_CLUSTER_ID=dev_cluster
-export COSTFLUENT_LOG_FORMAT=console
-export COSTFLUENT_LOG_LEVEL=debug
-go run ./cmd/agent
-
-# Run tests
-go test -v ./...
-
-# Run tests with coverage
-go test -coverprofile=coverage.out ./...
-go tool cover -html=coverage.out
-
-# Format code
-go fmt ./...
-
-# Lint
-golangci-lint run ./...
+make check    # gofmt, go vet, golangci-lint, go test -race, build
+make e2e      # installs the chart into a kind cluster and asserts a report reaches a stub receiver
+make docker   # builds ghcr.io/costfluent/k8s-agent
 ```
 
-## Project Structure
+`make e2e` needs docker, kind, kubectl and helm. It reads the chart from `../helm-charts`, or from
+`E2E_CHART`, and takes the kind node image from `KIND_NODE_IMAGE` when set. `E2E_KEEP_CLUSTER=1`
+leaves the cluster running for inspection.
 
-```
-k8s-agent/
-├── cmd/agent/
-│   └── main.go              # Entry point, orchestration
-├── api/v1/
-│   └── report.go            # API payload types
-├── internal/
-│   ├── config/
-│   │   └── config.go        # Configuration loading
-│   ├── collector/
-│   │   ├── kubelet.go       # Metrics collection from metrics-server
-│   │   ├── metadata.go      # Pod/node metadata from kube-apiserver
-│   │   └── aggregator.go    # Time-window metric aggregation
-│   ├── health/
-│   │   └── health.go        # Health checks (K8s API, scrape status)
-│   ├── metrics/
-│   │   └── metrics.go       # Prometheus metrics registration
-│   ├── reporter/
-│   │   └── http.go          # Costfluent API client
-│   └── storage/
-│       └── buffer.go        # PV-backed persistent buffer
-├── Dockerfile               # Multi-stage build (scratch)
-├── Makefile                 # Build, test, lint targets
-├── go.mod
-└── README.md
-```
-
-## Data Collected
-
-| Category | Fields | Source |
-|----------|--------|--------|
-| Container Metrics | cpu_usage, memory_usage | metrics-server |
-| Pod Metadata | name, namespace, labels, annotations | kube-apiserver |
-| Controller Info | controller_name, controller_kind | ownerReferences |
-| Node Info | instance_type, region, zone, capacity | kube-apiserver |
-| Node Pricing | vcpu_rate, ram_rate (on-prem) | node annotations |
-
-## On-Prem Pricing
-
-For clusters without cloud provider pricing, add annotations to nodes:
-
-```yaml
-apiVersion: v1
-kind: Node
-metadata:
-  name: worker-1
-  annotations:
-    costfluent.com/vcpu-hourly-rate: "0.05"      # $0.05/vCPU/hour
-    costfluent.com/ram-gb-hourly-rate: "0.007"   # $0.007/GB/hour
-    costfluent.com/gpu-hourly-rate: "1.50"       # $1.50/GPU/hour
-```
-
-## Metrics & Health
-
-### Prometheus Metrics
-
-Available at `:9010/metrics`:
-
-| Metric | Type | Description |
-|--------|------|-------------|
-| `costfluent_agent_info` | Gauge | Agent version, cluster info (labels) |
-| `costfluent_agent_scrape_duration_seconds` | Histogram | Scrape duration |
-| `costfluent_agent_pods_scraped_total` | Counter | Pods scraped |
-| `costfluent_agent_nodes_scraped_total` | Counter | Nodes scraped |
-| `costfluent_agent_samples_collected_total` | Counter | Metric samples collected |
-| `costfluent_agent_report_success_total` | Counter | Successful reports |
-| `costfluent_agent_report_failure_total` | Counter | Failed reports |
-| `costfluent_agent_report_size_bytes` | Histogram | Compressed report size |
-| `costfluent_agent_report_duration_seconds` | Histogram | Report send duration |
-| `costfluent_agent_buffer_size_bytes` | Gauge | Buffer size |
-| `costfluent_agent_buffer_report_count` | Gauge | Buffered reports count |
-| `costfluent_agent_heartbeat_success_total` | Counter | Successful heartbeats |
-| `costfluent_agent_heartbeat_failure_total` | Counter | Failed heartbeats |
-
-### Health Endpoints
-
-| Endpoint | Purpose | Response |
-|----------|---------|----------|
-| `/healthz` | Liveness probe | 200 if K8s API reachable |
-| `/readyz` | Readiness probe | JSON status with K8s/API/scrape state |
-
-```bash
-# Check readiness
-curl http://localhost:9010/readyz | jq
-```
-
-## RBAC Permissions
-
-The agent requires read-only access:
-
-```yaml
-rules:
-  - apiGroups: [""]
-    resources: ["nodes", "pods", "namespaces", "persistentvolumes", "persistentvolumeclaims"]
-    verbs: ["get", "list", "watch"]
-  - apiGroups: ["apps"]
-    resources: ["deployments", "replicasets", "statefulsets", "daemonsets"]
-    verbs: ["get", "list"]
-  - apiGroups: ["batch"]
-    resources: ["jobs", "cronjobs"]
-    verbs: ["get", "list"]
-  - apiGroups: ["metrics.k8s.io"]
-    resources: ["pods", "nodes"]
-    verbs: ["get", "list"]
-```
-
-## Troubleshooting
-
-**Agent not sending data:**
-```bash
-# Check logs
-kubectl -n costfluent logs -l app.kubernetes.io/name=costfluent-agent -f
-
-# Verify token
-kubectl -n costfluent get secret costfluent-agent -o jsonpath='{.data.token}' | base64 -d
-```
-
-**Metrics not available:**
-```bash
-# Check metrics-server
-kubectl top pods -A
-
-# If missing, install metrics-server
-kubectl apply -f https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml
-```
-
-**Buffer growing:**
-```bash
-# Check buffer stats
-kubectl -n costfluent exec -it costfluent-agent-0 -- ls -la /data/pending/
-```
+The agent reads only the in-cluster configuration, so it runs as a pod, never from a workstation.
 
 ## License
 
-Proprietary - Costfluent, Inc.
+Apache License 2.0; see [LICENSE](./LICENSE).
