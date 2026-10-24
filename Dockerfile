@@ -3,7 +3,9 @@
 # Pinned to the build host's own platform and cross-compiled with Go rather than emulated: buildx
 # sets TARGETOS/TARGETARCH per requested platform, and a CGO-free Go build cross-compiles natively.
 # Emulating the compiler under QEMU for arm64 would be minutes slower for an identical binary.
-FROM --platform=$BUILDPLATFORM golang:1.23-alpine AS builder
+# The Go is go.mod's toolchain line, pinned by digest and pulled from Docker Hub, so the file builds
+# anywhere without registry credentials.
+FROM --platform=$BUILDPLATFORM golang:1.27.3-alpine@sha256:f2c872bcee949b7be9c490efd02b48a8a2fbf947cdf533f1c58525ec9d8170fd AS builder
 
 ARG VERSION=dev
 ARG GIT_COMMIT=unknown
@@ -24,7 +26,7 @@ RUN go mod download
 COPY . .
 
 # Build
-RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH:-amd64} go build \
+RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH:-amd64} go build -trimpath \
     -ldflags="-w -s -X main.Version=${VERSION} -X main.GitCommit=${GIT_COMMIT} -X main.BuildTime=${BUILD_TIME}" \
     -o /costfluent-agent \
     ./cmd/agent

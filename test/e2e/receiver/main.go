@@ -1,4 +1,5 @@
-// Command receiver is the stub Costfluent API the kind smoke test points the agent at. It accepts
+// Command receiver is the stub Costfluent API the kind smoke test points the agent at. It describes
+// RECEIVER_TOKEN on GET /v1/me as the cluster token of kind-e2e the chart asks for, accepts
 // POST /v1/kubernetes/reports only when the body is gzip and the bearer token matches
 // RECEIVER_TOKEN, keeps each accepted body, and serves them back as a JSON array on GET /reports.
 // Anything else it refuses and counts, so the test can tell a wrong request from no request.
@@ -39,6 +40,14 @@ func main() {
 	}
 	s := &store{}
 	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v1/me", func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer "+token {
+			s.refuse(w, http.StatusUnauthorized, "missing or wrong bearer token on /v1/me")
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"organizationId":"org_e2e","tokenType":"cluster","tokenName":"kind-e2e","capabilities":["reportKubernetesUsage"],"clusterId":"kind-e2e"}`)
+	})
 	mux.HandleFunc("POST /v1/kubernetes/reports", func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("Authorization") != "Bearer "+token {
 			s.refuse(w, http.StatusUnauthorized, "missing or wrong bearer token")

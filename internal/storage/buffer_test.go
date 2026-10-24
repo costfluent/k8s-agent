@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"strings"
 	"testing"
 	"time"
 
@@ -34,7 +35,7 @@ func TestBuffer_ReturnsOldestFirstAndRemoves(t *testing.T) {
 		}
 	}
 	e, ok, err := b.Oldest()
-	if err != nil || !ok || !e.WindowStart.Equal(base.Add(time.Hour)) || len(e.Body) == 0 {
+	if err != nil || !ok || !e.WindowStart.Equal(base.Add(time.Hour)) || !e.WindowEnd.Equal(base.Add(2*time.Hour)) || len(e.Body) == 0 {
 		t.Fatalf("oldest = %+v %v %v", e, ok, err)
 	}
 	if err := b.Remove(e.Name); err != nil {
@@ -113,5 +114,97 @@ func TestInstanceID_IsCreatedOnceAndKept(t *testing.T) {
 	second, err := InstanceID(dir)
 	if err != nil || second != first {
 		t.Fatalf("second = %q %v", second, err)
+	}
+}
+
+func TestClusterID_IsKeptAndReplaced(t *testing.T) {
+	dir := t.TempDir()
+	if id, err := ClusterID(dir); err != nil || id != "" {
+		t.Fatalf("before any save: id = %q, %v; want none", id, err)
+	}
+	if err := SaveClusterID(dir, "pve-dev"); err != nil {
+		t.Fatal(err)
+	}
+	if id, err := ClusterID(dir); err != nil || id != "pve-dev" {
+		t.Fatalf("id = %q, %v; want pve-dev", id, err)
+	}
+	if err := SaveClusterID(dir, "pve-prod"); err != nil {
+		t.Fatal(err)
+	}
+	if id, err := ClusterID(dir); err != nil || id != "pve-prod" {
+		t.Fatalf("id = %q, %v; want the replacement pve-prod", id, err)
+	}
+	if leftovers, _ := filepath.Glob(filepath.Join(dir, ".cluster-id*")); len(leftovers) != 0 {
+		t.Fatalf("saving left temporary files behind: %v", leftovers)
+	}
+}
+
+func TestClusterID_Edges(t *testing.T) {
+	t.Run("blank file is no id", func(t *testing.T) {
+		dir := t.TempDir()
+		if err := os.WriteFile(filepath.Join(dir, "cluster-id"), []byte(" \n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if id, err := ClusterID(dir); err != nil || id != "" {
+			t.Fatalf("id = %q, %v; want none", id, err)
+		}
+	})
+	t.Run("unreadable path", func(t *testing.T) {
+		dir := t.TempDir()
+		if err := os.Mkdir(filepath.Join(dir, "cluster-id"), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := ClusterID(dir); err == nil || !strings.Contains(err.Error(), "reading") {
+			t.Fatalf("err = %v, want the read failure", err)
+		}
+	})
+	t.Run("unwritable directory", func(t *testing.T) {
+		missing := filepath.Join(t.TempDir(), "missing")
+		if err := SaveClusterID(missing, "pve-dev"); err == nil || !strings.Contains(err.Error(), "writing") {
+			t.Fatalf("err = %v, want the write failure", err)
+		}
+	})
+	t.Run("irreplaceable file", func(t *testing.T) {
+		dir := t.TempDir()
+		if err := os.MkdirAll(filepath.Join(dir, "cluster-id", "occupied"), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := SaveClusterID(dir, "pve-dev"); err == nil || !strings.Contains(err.Error(), "writing") {
+			t.Fatalf("err = %v, want the replace failure", err)
+		}
+		if leftovers, _ := filepath.Glob(filepath.Join(dir, ".cluster-id*")); len(leftovers) != 0 {
+			t.Fatalf("a failed save left temporary files behind: %v", leftovers)
+		}
+	})
+}
+
+func TestBuffer_HoldsOnlyTheWindowsItBuffered(t *testing.T) {
+	dir := t.TempDir()
+	b, err := Open(dir, zap.NewNop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	b.now = func() time.Time { return base.Add(10 * time.Hour) }
+	if err := b.Put(report(2)); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		start time.Time
+		want  bool
+	}{
+		{base.Add(2 * time.Hour), true},
+		{base.Add(2 * time.Hour).In(time.FixedZone("CEST", 2*60*60)), true},
+		{base.Add(time.Hour), false},
+		{base.Add(3 * time.Hour), false},
+	} {
+		if got, err := b.Holds(tc.start); err != nil || got != tc.want {
+			t.Errorf("Holds(%s) = %v, %v; want %v", tc.start, got, err, tc.want)
+		}
+	}
+	if err := os.RemoveAll(filepath.Join(dir, bufferDir)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.Holds(base.Add(2 * time.Hour)); err == nil {
+		t.Fatal("an unreadable buffer must be reported, not read as empty")
 	}
 }

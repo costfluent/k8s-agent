@@ -3,28 +3,36 @@ package collector
 import (
 	"context"
 	"fmt"
+	"maps"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf16"
 
 	"go.uber.org/zap"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
-	"k8s.io/client-go/informers"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/kubernetes"
 	listersv1 "k8s.io/client-go/listers/core/v1"
+	"k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/cache"
 
 	v1 "github.com/costfluent/k8s-agent/api/v1"
 	"github.com/costfluent/k8s-agent/internal/config"
+	"github.com/costfluent/k8s-agent/internal/metrics"
 )
 
 const (
 	gpuResource            = corev1.ResourceName("nvidia.com/gpu")
 	namespaceLabelsRefresh = 5 * time.Minute
-	ownerCacheLimit        = 10000
+	cacheSyncTimeout       = 5 * time.Minute
+	listPageSize           = 500
 )
 
 // Pod labels that identify a revision or an ordinal rather than a workload. They are never sent.
@@ -50,44 +58,233 @@ type ContainerSpec struct {
 
 // Metadata reads nodes and pods from informer caches and resolves pod controllers.
 type Metadata struct {
-	client  kubernetes.Interface
-	cfg     *config.Config
-	logger  *zap.Logger
-	factory informers.SharedInformerFactory
-	nodes   listersv1.NodeLister
-	pods    listersv1.PodLister
+	client kubernetes.Interface
+	cfg    *config.Config
+	logger *zap.Logger
+	nodes  listersv1.NodeLister
+	pods   cache.Store
+
+	syncTimeout time.Duration
 
 	mu              sync.Mutex
-	owners          map[string]owner
+	owners          *ownerCache
 	namespaceLabels map[string]map[string]string
 	namespacesAt    time.Time
 }
 
 type owner struct{ kind, name string }
 
-// NewMetadata wires node and pod informers. Call Start before reading.
+// NewClient builds the Kubernetes API client the agent reads metadata with.
+// Its rate limit is the configured one: client-go's default of 5 requests a second resolves the
+// owners of a large cluster's pods for minutes.
+func NewClient(restCfg *rest.Config, cfg *config.Config) (kubernetes.Interface, error) {
+	c := rest.CopyConfig(restCfg)
+	if cfg.KubeAPIQPS > 0 {
+		c.QPS, c.Burst = float32(cfg.KubeAPIQPS), cfg.KubeAPIBurst
+	}
+	return kubernetes.NewForConfig(c)
+}
+
+// Collect is one poll: the nodes, the running pods, and each kubelet's usage.
+func Collect(ctx context.Context, metadata *Metadata, kubelet *KubeletCollector, now time.Time) (Observation, error) {
+	began := time.Now()
+	nodes, err := metadata.Nodes()
+	if err != nil {
+		return Observation{}, err
+	}
+	pods, err := metadata.Pods(ctx)
+	if err != nil {
+		return Observation{}, err
+	}
+	obs := Observation{Time: now, Pods: pods}
+	obs.Usage, obs.Unscraped = kubelet.Scrape(ctx, nodes)
+	// Owner resolution and scrapes fall back rather than fail, so a poll cut short reads as a cluster
+	// with no usage and unresolved controllers.
+	if err := ctx.Err(); err != nil {
+		return Observation{}, fmt.Errorf("poll interrupted: %w", err)
+	}
+	for _, n := range nodes {
+		obs.Nodes = append(obs.Nodes, ConvertNode(n))
+	}
+	obs.Duration = time.Since(began)
+	return obs, nil
+}
+
+// NewMetadata prepares node and pod informers. Call Start before reading.
 func NewMetadata(client kubernetes.Interface, cfg *config.Config, logger *zap.Logger) *Metadata {
-	factory := informers.NewSharedInformerFactory(client, 0)
-	return &Metadata{
-		client:  client,
-		cfg:     cfg,
-		logger:  logger.Named("metadata"),
-		factory: factory,
-		nodes:   factory.Core().V1().Nodes().Lister(),
-		pods:    factory.Core().V1().Pods().Lister(),
-		owners:  map[string]owner{},
+	size := cfg.OwnerCacheSize
+	if size <= 0 {
+		size = config.DefaultOwnerCacheSize
+	}
+	return &Metadata{client: client, cfg: cfg, logger: logger.Named("metadata"), owners: newOwnerCache(size), syncTimeout: cacheSyncTimeout}
+}
+
+// Start runs the node and pod informers until ctx ends and waits for their first sync. Each lists
+// in pages that are cut down to what the agent reads before the next page arrives, so the whole
+// cluster is never held in memory as the API server sent it.
+func (m *Metadata) Start(ctx context.Context) error {
+	core := m.client.CoreV1()
+	nodes := cache.NewSharedIndexInformer(pagedListWatch{&cache.ListWatch{
+		ListWithContextFunc: func(ctx context.Context, opts metav1.ListOptions) (runtime.Object, error) {
+			items, rv, err := listPages(ctx, opts, func(ctx context.Context, opts metav1.ListOptions) ([]corev1.Node, metav1.ListMeta, error) {
+				l, err := core.Nodes().List(ctx, opts)
+				if err != nil {
+					return nil, metav1.ListMeta{}, err
+				}
+				return l.Items, l.ListMeta, nil
+			}, func(n *corev1.Node) corev1.Node {
+				stripNode(n)
+				return *n
+			})
+			return &corev1.NodeList{ListMeta: metav1.ListMeta{ResourceVersion: rv}, Items: items}, err
+		},
+		WatchFuncWithContext: func(ctx context.Context, opts metav1.ListOptions) (watch.Interface, error) {
+			return core.Nodes().Watch(ctx, opts)
+		},
+	}}, &corev1.Node{}, 0, cache.Indexers{})
+	pods := cache.NewSharedIndexInformer(pagedListWatch{&cache.ListWatch{
+		ListWithContextFunc: func(ctx context.Context, opts metav1.ListOptions) (runtime.Object, error) {
+			items, rv, err := listPages(ctx, opts, func(ctx context.Context, opts metav1.ListOptions) ([]corev1.Pod, metav1.ListMeta, error) {
+				l, err := core.Pods("").List(ctx, opts)
+				if err != nil {
+					return nil, metav1.ListMeta{}, err
+				}
+				return l.Items, l.ListMeta, nil
+			}, m.cachePod)
+			return &cachedPodList{ListMeta: metav1.ListMeta{ResourceVersion: rv}, Items: items}, err
+		},
+		WatchFuncWithContext: func(ctx context.Context, opts metav1.ListOptions) (watch.Interface, error) {
+			return core.Pods("").Watch(ctx, opts)
+		},
+	}}, &corev1.Pod{}, 0, cache.Indexers{})
+	if err := nodes.SetTransform(func(obj any) (any, error) {
+		if n, ok := obj.(*corev1.Node); ok {
+			stripNode(n)
+		}
+		return obj, nil
+	}); err != nil {
+		return fmt.Errorf("node informer: %w", err)
+	}
+	if err := pods.SetTransform(func(obj any) (any, error) {
+		if p, ok := obj.(*corev1.Pod); ok {
+			return m.cachePod(p), nil
+		}
+		return obj, nil
+	}); err != nil {
+		return fmt.Errorf("pod informer: %w", err)
+	}
+	m.nodes = listersv1.NewNodeLister(nodes.GetIndexer())
+	m.pods = pods.GetStore()
+	go nodes.Run(ctx.Done())
+	go pods.Run(ctx.Done())
+	syncCtx, cancel := context.WithTimeout(ctx, m.syncTimeout)
+	defer cancel()
+	if !cache.WaitForCacheSync(syncCtx.Done(), nodes.HasSynced, pods.HasSynced) {
+		if err := ctx.Err(); err != nil {
+			return fmt.Errorf("node and pod informers did not sync: %w", err)
+		}
+		return fmt.Errorf("node and pod informers did not sync within %s: check that the agent's ClusterRole grants list and watch on nodes and pods", m.syncTimeout)
+	}
+	return nil
+}
+
+// pagedListWatch keeps an informer's initial list on its ListWithContextFunc, which listPages serves. Since
+// client-go v0.35 a reflector streams the initial list as watch events instead (WatchListClient),
+// which bypasses it and is not what the load test measures the agent's budgets with.
+type pagedListWatch struct{ *cache.ListWatch }
+
+// IsWatchListSemanticsUnSupported opts the reflector out of streaming lists.
+func (pagedListWatch) IsWatchListSemanticsUnSupported() bool { return true }
+
+// listPages reads a whole list listPageSize items at a time from a consistent read, which the API
+// server pages, and converts each item to what the cache keeps before the next page is read. It
+// ignores the reflector's own resource version and limit: a paged list is always the latest state.
+func listPages[T, C any](ctx context.Context, opts metav1.ListOptions,
+	page func(context.Context, metav1.ListOptions) ([]T, metav1.ListMeta, error), convert func(*T) C,
+) ([]C, string, error) {
+	opts.Limit, opts.Continue, opts.ResourceVersion, opts.ResourceVersionMatch = listPageSize, "", "", ""
+	var all []C
+	for {
+		items, meta, err := page(ctx, opts)
+		if err != nil {
+			return nil, "", err
+		}
+		if all == nil && meta.RemainingItemCount != nil {
+			all = make([]C, 0, len(items)+int(*meta.RemainingItemCount))
+		}
+		for i := range items {
+			all = append(all, convert(&items[i]))
+		}
+		if meta.Continue == "" {
+			return all, meta.ResourceVersion, nil
+		}
+		opts.Continue = meta.Continue
 	}
 }
 
-// Start runs the informers until ctx ends and waits for their first sync.
-func (m *Metadata) Start(ctx context.Context) error {
-	m.factory.Start(ctx.Done())
-	for informer, synced := range m.factory.WaitForCacheSync(ctx.Done()) {
-		if !synced {
-			return fmt.Errorf("informer %v did not sync: %w", informer, ctx.Err())
+// stripNode cuts a node down, in place, to what ConvertNode and the kubelet scrape read.
+func stripNode(n *corev1.Node) {
+	*n = corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{Name: n.Name, Labels: n.Labels, Annotations: keepKeys(n.Annotations, v1.RateAnnotations)},
+		Spec:       corev1.NodeSpec{ProviderID: n.Spec.ProviderID},
+		Status: corev1.NodeStatus{
+			Capacity:        keepResources(n.Status.Capacity, corev1.ResourceCPU, corev1.ResourceMemory, gpuResource),
+			Allocatable:     keepResources(n.Status.Allocatable, corev1.ResourceCPU, corev1.ResourceMemory),
+			Addresses:       n.Status.Addresses,
+			DaemonEndpoints: n.Status.DaemonEndpoints,
+		},
+	}
+}
+
+// keepKeys returns m without the keys outside allowed, reusing m when nothing is dropped.
+func keepKeys(m map[string]string, allowed []string) map[string]string {
+	if len(m) == 0 {
+		return nil
+	}
+	kept := 0
+	for _, k := range allowed {
+		if _, ok := m[k]; ok {
+			kept++
 		}
 	}
-	return nil
+	if kept == len(m) {
+		return m
+	}
+	if kept == 0 {
+		return nil
+	}
+	out := make(map[string]string, kept)
+	for _, k := range allowed {
+		if v, ok := m[k]; ok {
+			out[k] = v
+		}
+	}
+	return out
+}
+
+func keepResources(r corev1.ResourceList, names ...corev1.ResourceName) corev1.ResourceList {
+	if len(r) == 0 {
+		return nil
+	}
+	kept := 0
+	for _, n := range names {
+		if _, ok := r[n]; ok {
+			kept++
+		}
+	}
+	if kept == len(r) {
+		return r
+	}
+	if kept == 0 {
+		return nil
+	}
+	out := make(corev1.ResourceList, kept)
+	for _, n := range names {
+		if q, ok := r[n]; ok {
+			out[n] = q
+		}
+	}
+	return out
 }
 
 // Nodes returns the cluster's nodes, sorted by name.
@@ -118,8 +315,8 @@ func ConvertNode(node *corev1.Node) v1.Node {
 		CapacityGPU:            gpus,
 		AllocatableCPUCores:    cores(node.Status.Allocatable.Cpu()),
 		AllocatableMemoryBytes: bytesOf(node.Status.Allocatable.Memory()),
-		Labels:                 copyMap(node.Labels),
-		Annotations:            pick(node.Annotations, v1.RateAnnotations, 0),
+		Labels:                 fitMap(node.Labels, "node_labels"),
+		Annotations:            fitMap(pick(node.Annotations, v1.RateAnnotations, 0), "node_annotations"),
 	}
 }
 
@@ -133,41 +330,37 @@ func isSpot(l map[string]string) bool {
 
 // Pods returns the running pods bound to a node, with controllers resolved and labels filtered.
 func (m *Metadata) Pods(ctx context.Context) ([]PodInfo, error) {
-	pods, err := m.pods.List(labels.Everything())
-	if err != nil {
-		return nil, fmt.Errorf("listing pods: %w", err)
-	}
+	cached := m.pods.List()
 	nsLabels := m.namespaceLabelsFor(ctx)
-
-	out := make([]PodInfo, 0, len(pods))
-	for _, pod := range pods {
-		if pod.Spec.NodeName == "" || pod.Status.Phase != corev1.PodRunning {
+	out := make([]PodInfo, 0, len(cached))
+	for _, obj := range cached {
+		pod, ok := obj.(*cachedPod)
+		if !ok {
+			return nil, fmt.Errorf("listing pods: the cache holds a %T", obj)
+		}
+		if pod.Node == "" || pod.Phase != string(corev1.PodRunning) {
 			continue
 		}
-		kind, name := m.resolveController(ctx, pod)
-		info := PodInfo{
-			Pod: v1.Pod{
-				Namespace:       pod.Namespace,
-				Name:            pod.Name,
-				Node:            pod.Spec.NodeName,
-				ControllerKind:  kind,
-				Controller:      name,
-				Labels:          m.podLabels(pod.Labels),
-				Annotations:     pick(pod.Annotations, m.cfg.AllowedAnnotations, config.MaxAnnotationValueChars),
-				NamespaceLabels: nsLabels[pod.Namespace],
-			},
-		}
-		for _, c := range pod.Spec.Containers {
-			info.Specs = append(info.Specs, ContainerSpec{
-				Name:               c.Name,
-				CPURequestCores:    cores(c.Resources.Requests.Cpu()),
-				MemoryRequestBytes: bytesOf(c.Resources.Requests.Memory()),
-				GPURequest:         gpuRequest(c.Resources),
-			})
-		}
-		out = append(out, info)
+		out = append(out, m.podInfo(ctx, pod, nsLabels))
 	}
 	return out, nil
+}
+
+func (m *Metadata) podInfo(ctx context.Context, pod *cachedPod, nsLabels map[string]map[string]string) PodInfo {
+	kind, name := m.resolveController(ctx, pod)
+	return PodInfo{
+		Pod: v1.Pod{
+			Namespace:       pod.Namespace,
+			Name:            pod.Name,
+			Node:            pod.Node,
+			ControllerKind:  kind,
+			Controller:      name,
+			Labels:          fitMap(pod.Labels, "pod_labels"),
+			Annotations:     fitMap(pod.Annotations, "pod_annotations"),
+			NamespaceLabels: nsLabels[pod.Namespace],
+		},
+		Specs: pod.Containers,
+	}
 }
 
 func gpuRequest(r corev1.ResourceRequirements) int {
@@ -178,22 +371,6 @@ func gpuRequest(r corev1.ResourceRequirements) int {
 		return int(q.Value())
 	}
 	return 0
-}
-
-func (m *Metadata) podLabels(l map[string]string) map[string]string {
-	if len(m.cfg.AllowedLabels) > 0 {
-		return pick(l, m.cfg.AllowedLabels, 0)
-	}
-	out := map[string]string{}
-	for k, v := range l {
-		if !noisePodLabels[k] {
-			out[k] = v
-		}
-	}
-	if len(out) == 0 {
-		return nil
-	}
-	return out
 }
 
 func (m *Metadata) namespaceLabelsFor(ctx context.Context) map[string]map[string]string {
@@ -212,49 +389,40 @@ func (m *Metadata) namespaceLabelsFor(ctx context.Context) map[string]map[string
 	}
 	labelsByNamespace := make(map[string]map[string]string, len(list.Items))
 	for _, ns := range list.Items {
-		labelsByNamespace[ns.Name] = copyMap(ns.Labels)
+		labelsByNamespace[ns.Name] = fitMap(ns.Labels, "namespace_labels")
 	}
 	m.namespaceLabels, m.namespacesAt = labelsByNamespace, time.Now()
 	return labelsByNamespace
 }
 
 // resolveController follows a ReplicaSet to its Deployment and a Job to its CronJob.
-func (m *Metadata) resolveController(ctx context.Context, pod *corev1.Pod) (string, string) {
-	ref := metav1.GetControllerOf(pod)
-	if ref == nil {
-		if len(pod.OwnerReferences) == 0 {
-			return "", ""
-		}
-		ref = &pod.OwnerReferences[0]
-	}
-	if ref.Kind != "ReplicaSet" && ref.Kind != "Job" {
-		return ref.Kind, ref.Name
+func (m *Metadata) resolveController(ctx context.Context, pod *cachedPod) (string, string) {
+	kind, name := pod.OwnerKind, pod.OwnerName
+	if kind != "ReplicaSet" && kind != "Job" {
+		return kind, name
 	}
 
-	key := pod.Namespace + "/" + ref.Kind + "/" + ref.Name
+	key := pod.Namespace + "/" + kind + "/" + name
 	m.mu.Lock()
-	cached, ok := m.owners[key]
+	cached, ok := m.owners.get(key)
 	m.mu.Unlock()
 	if ok {
 		return cached.kind, cached.name
 	}
 
-	owners, err := m.ownersOf(ctx, pod.Namespace, ref.Kind, ref.Name)
+	owners, err := m.ownersOf(ctx, pod.Namespace, kind, name)
 	if err != nil {
 		m.logger.Debug("resolving controller failed; using the direct owner",
-			zap.String("namespace", pod.Namespace), zap.String("kind", ref.Kind), zap.String("name", ref.Name), zap.Error(err))
-		return ref.Kind, ref.Name
+			zap.String("namespace", pod.Namespace), zap.String("kind", kind), zap.String("name", name), zap.Error(err))
+		return kind, name
 	}
 
-	resolved := owner{kind: ref.Kind, name: ref.Name}
+	resolved := owner{kind: kind, name: name}
 	if len(owners) > 0 {
 		resolved = owner{kind: owners[0].Kind, name: owners[0].Name}
 	}
 	m.mu.Lock()
-	if len(m.owners) >= ownerCacheLimit {
-		m.owners = map[string]owner{}
-	}
-	m.owners[key] = resolved
+	m.owners.put(key, resolved)
 	m.mu.Unlock()
 	return resolved.kind, resolved.name
 }
@@ -298,6 +466,58 @@ func pick(src map[string]string, allowed []string, maxChars int) map[string]stri
 	return out
 }
 
+// fitMap returns src within the API's map caps: src itself when it fits, which callers share and
+// never modify, otherwise in key order the first MaxMapEntries entries whose key and value fit the
+// length caps. The API refuses a whole report over them, so the entries left out are counted under
+// mapName instead.
+func fitMap(src map[string]string, mapName string) map[string]string {
+	if len(src) == 0 {
+		return nil
+	}
+	if fits(src) {
+		return src
+	}
+	keys := slices.Sorted(maps.Keys(src))
+	out := make(map[string]string, min(len(src), v1.MaxMapEntries))
+	for _, k := range keys {
+		if len(out) == v1.MaxMapEntries {
+			break
+		}
+		if v := src[k]; utf16Len(k) <= v1.MaxMapKeyLength && utf16Len(v) <= v1.MaxMapValueLength {
+			out[k] = v
+		}
+	}
+	if dropped := len(src) - len(out); dropped > 0 {
+		metrics.MapEntriesDropped.WithLabelValues(mapName).Add(float64(dropped))
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+// fits reports whether m is within the map caps as it is, so fitMap can share it rather than copy.
+func fits(m map[string]string) bool {
+	if len(m) > v1.MaxMapEntries {
+		return false
+	}
+	for k, v := range m {
+		if utf16Len(k) > v1.MaxMapKeyLength || utf16Len(v) > v1.MaxMapValueLength {
+			return false
+		}
+	}
+	return true
+}
+
+// utf16Len is s's length as the API counts it.
+func utf16Len(s string) int {
+	n := 0
+	for _, r := range s {
+		n += utf16.RuneLen(r)
+	}
+	return n
+}
+
 func firstLabel(l map[string]string, keys ...string) string {
 	for _, k := range keys {
 		if v := l[k]; v != "" {
@@ -305,17 +525,6 @@ func firstLabel(l map[string]string, keys ...string) string {
 		}
 	}
 	return ""
-}
-
-func copyMap(src map[string]string) map[string]string {
-	if len(src) == 0 {
-		return nil
-	}
-	out := make(map[string]string, len(src))
-	for k, v := range src {
-		out[k] = v
-	}
-	return out
 }
 
 func cores(q *resource.Quantity) float64 {

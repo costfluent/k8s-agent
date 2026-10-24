@@ -1,4 +1,4 @@
-.PHONY: build test check-test e2e lint fmt fmt-check vet check clean docker run help
+.PHONY: build test check-test e2e load lint fmt fmt-check vet check clean docker run help
 
 # Build variables
 BINARY_NAME := costfluent-k8s-agent
@@ -9,8 +9,8 @@ LDFLAGS := -ldflags "-s -w -X main.Version=$(VERSION) -X main.GitCommit=$(GIT_CO
 
 # Go variables
 GOBIN := $(shell go env GOPATH)/bin
-GOLANGCI_LINT_VERSION := v2.4.0
-GOLANGCI_LINT_TOOLCHAIN := go1.24.10
+GOLANGCI_LINT_VERSION := v2.14.0
+GOLANGCI_LINT_TOOLCHAIN := go1.27.2
 GOLANGCI_LINT := $(GOBIN)/golangci-lint-$(GOLANGCI_LINT_VERSION)
 
 # Docker variables
@@ -77,11 +77,6 @@ docker:
 	docker build -t $(DOCKER_IMAGE):$(DOCKER_TAG) .
 	docker tag $(DOCKER_IMAGE):$(DOCKER_TAG) $(DOCKER_IMAGE):latest
 
-## docker-push: Push Docker image
-docker-push: docker
-	docker push $(DOCKER_IMAGE):$(DOCKER_TAG)
-	docker push $(DOCKER_IMAGE):latest
-
 ## run: Run locally (requires kubeconfig)
 run: build
 	./bin/$(BINARY_NAME)
@@ -94,10 +89,6 @@ run-debug: build
 deps:
 	go mod download
 
-## generate: Run go generate
-generate:
-	go generate ./...
-
 ## check-test: Run tests without leaving a coverage file
 check-test:
 	go test -race ./...
@@ -105,6 +96,10 @@ check-test:
 ## e2e: Install the chart into a kind cluster and assert a report reaches a stub receiver (needs docker, kind, kubectl, helm; not part of check)
 e2e:
 	go test -tags e2e -count=1 -timeout 15m -v ./test/e2e/
+
+## load: Run the agent against a fake API server and kubelets at 1,000 nodes and 50,000 pods and hold it to its memory, API and report budgets (not part of check)
+load:
+	go test -tags load -count=1 -timeout 30m -v ./test/load/
 
 ## check: Run non-mutating build, format, vet, lint, and tests
 check: fmt-check vet lint check-test

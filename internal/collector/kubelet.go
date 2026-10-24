@@ -12,17 +12,22 @@ import (
 
 	dto "github.com/prometheus/client_model/go"
 	"github.com/prometheus/common/expfmt"
+	"github.com/prometheus/common/model"
 	"go.uber.org/zap"
 	corev1 "k8s.io/api/core/v1"
 
+	"github.com/costfluent/k8s-agent/internal/config"
 	"github.com/costfluent/k8s-agent/internal/metrics"
 )
 
 const (
 	defaultKubeletPort = 10250
-	scrapeConcurrency  = 10
-	scrapeTimeout      = 5 * time.Second
-	maxMetricsBytes    = 32 << 20
+	// A cluster gets one scrape at a time per nodesPerScrape nodes, at least minScrapes and at most
+	// the configured ceiling, so a large cluster's poll stays short without a burst on small ones.
+	minScrapes      = 10
+	nodesPerScrape  = 20
+	scrapeTimeout   = 5 * time.Second
+	maxMetricsBytes = 32 << 20
 
 	metricCPU    = "container_cpu_usage_seconds_total"
 	metricMemory = "container_memory_working_set_bytes"
@@ -54,6 +59,8 @@ type KubeletCollector struct {
 	addressTypes []corev1.NodeAddressType
 	logger       *zap.Logger
 	timeout      time.Duration
+	maxBody      int64
+	maxScrapes   int
 
 	mu   sync.Mutex
 	prev map[string]map[ContainerKey]counterSample
@@ -61,36 +68,40 @@ type KubeletCollector struct {
 
 // NewKubeletCollector uses client, which must carry the service-account bearer token and the TLS
 // settings for the kubelets.
-func NewKubeletCollector(client *http.Client, addressTypes []corev1.NodeAddressType, logger *zap.Logger) *KubeletCollector {
+func NewKubeletCollector(client *http.Client, addressTypes []corev1.NodeAddressType, maxConcurrency int, logger *zap.Logger) *KubeletCollector {
 	return &KubeletCollector{
 		client:       client,
 		addressTypes: addressTypes,
 		logger:       logger.Named("kubelet"),
 		timeout:      scrapeTimeout,
+		maxBody:      maxMetricsBytes,
+		maxScrapes:   maxConcurrency,
 		prev:         map[string]map[ContainerKey]counterSample{},
 	}
 }
 
-// Scrape reads every node, scrapeConcurrency at a time. A node that fails is counted and left out;
-// it never aborts the poll.
-func (c *KubeletCollector) Scrape(ctx context.Context, nodes []*corev1.Node) map[ContainerKey]ContainerUsage {
+// Scrape reads every node, a few at a time, and returns the usage and the nodes that failed. A node
+// that fails is counted and left out; it never aborts the poll.
+func (c *KubeletCollector) Scrape(ctx context.Context, nodes []*corev1.Node) (map[ContainerKey]ContainerUsage, map[string]bool) {
 	type result struct {
 		node    string
 		samples map[ContainerKey]rawSample
+		failed  bool
 	}
 	results := make(chan result, len(nodes))
-	sem := make(chan struct{}, scrapeConcurrency)
+	sem := make(chan struct{}, c.concurrency(len(nodes)))
 	var wg sync.WaitGroup
 	for _, node := range nodes {
+		sem <- struct{}{}
 		wg.Add(1)
 		go func(node *corev1.Node) {
 			defer wg.Done()
-			sem <- struct{}{}
 			defer func() { <-sem }()
 			samples, err := c.scrapeNode(ctx, node)
 			if err != nil {
 				metrics.NodeScrapes.WithLabelValues("error").Inc()
 				c.logger.Warn("kubelet scrape failed", zap.String("node", node.Name), zap.Error(err))
+				results <- result{node: node.Name, failed: true}
 				return
 			}
 			metrics.NodeScrapes.WithLabelValues("ok").Inc()
@@ -113,7 +124,15 @@ func (c *KubeletCollector) Scrape(ctx context.Context, nodes []*corev1.Node) map
 	}
 
 	usage := map[ContainerKey]ContainerUsage{}
+	var failed map[string]bool
 	for r := range results {
+		if r.failed {
+			if failed == nil {
+				failed = map[string]bool{}
+			}
+			failed[r.node] = true
+			continue
+		}
 		prev := c.prev[r.node]
 		next := make(map[ContainerKey]counterSample, len(r.samples))
 		for key, s := range r.samples {
@@ -135,7 +154,15 @@ func (c *KubeletCollector) Scrape(ctx context.Context, nodes []*corev1.Node) map
 		}
 		c.prev[r.node] = next
 	}
-	return usage
+	return usage, failed
+}
+
+func (c *KubeletCollector) concurrency(nodes int) int {
+	ceiling := c.maxScrapes
+	if ceiling <= 0 {
+		ceiling = config.DefaultScrapeConcurrency
+	}
+	return max(1, min(ceiling, max(minScrapes, (nodes+nodesPerScrape-1)/nodesPerScrape)))
 }
 
 // cpuRate is the core rate between two counter samples. A counter that went down restarted from
@@ -179,7 +206,36 @@ func (c *KubeletCollector) scrapeNode(ctx context.Context, node *corev1.Node) (m
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("GET %s: status %d (the agent's ClusterRole needs nodes/metrics get)", endpoint, resp.StatusCode)
 	}
-	return parseResourceMetrics(io.LimitReader(resp.Body, maxMetricsBytes), time.Now())
+	body := &cappedReader{r: resp.Body, left: c.maxBody}
+	samples, err := parseResourceMetrics(body, time.Now())
+	if body.truncated {
+		metrics.KubeletBodiesTruncated.Inc()
+		c.logger.Warn("kubelet metrics cut at the size limit; containers past it are missing", zap.String("node", node.Name), zap.Int64("limit_bytes", c.maxBody))
+	}
+	return samples, err
+}
+
+// cappedReader ends a body after left bytes and records whether more followed.
+type cappedReader struct {
+	r         io.Reader
+	left      int64
+	truncated bool
+}
+
+func (c *cappedReader) Read(p []byte) (int, error) {
+	if c.left <= 0 {
+		var probe [1]byte
+		if n, _ := c.r.Read(probe[:]); n > 0 {
+			c.truncated = true
+		}
+		return 0, io.EOF
+	}
+	if int64(len(p)) > c.left {
+		p = p[:c.left]
+	}
+	n, err := c.r.Read(p)
+	c.left -= int64(n)
+	return n, err
 }
 
 func (c *KubeletCollector) endpoint(node *corev1.Node) (string, error) {
@@ -198,7 +254,7 @@ func (c *KubeletCollector) endpoint(node *corev1.Node) (string, error) {
 }
 
 func parseResourceMetrics(r io.Reader, scrapedAt time.Time) (map[ContainerKey]rawSample, error) {
-	var parser expfmt.TextParser
+	parser := expfmt.NewTextParser(model.UTF8Validation)
 	families, err := parser.TextToMetricFamilies(r)
 	if err != nil {
 		return nil, fmt.Errorf("parsing /metrics/resource: %w", err)

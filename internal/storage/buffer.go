@@ -6,7 +6,6 @@ import (
 	"bytes"
 	"compress/gzip"
 	"crypto/rand"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -30,12 +29,14 @@ const (
 	suffix         = ".json.gz"
 	nameTimeLayout = "20060102T150405Z"
 	instanceIDFile = "instance-id"
+	clusterIDFile  = "cluster-id"
 )
 
 // Entry is one buffered report, already gzip-encoded for the wire.
 type Entry struct {
 	Name        string
 	WindowStart time.Time
+	WindowEnd   time.Time
 	Body        []byte
 }
 
@@ -92,11 +93,27 @@ func (b *Buffer) Put(r v1.Report) error {
 	return b.enforceLocked()
 }
 
+// Holds reports whether a report for the window starting at start is buffered.
+func (b *Buffer) Holds(start time.Time) (bool, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	files, err := b.listLocked()
+	if err != nil {
+		return false, err
+	}
+	for _, f := range files {
+		if f.start.Equal(start) {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 // Encode is the wire body: gzip JSON.
 func Encode(r v1.Report) ([]byte, error) {
 	var buf bytes.Buffer
 	zw := gzip.NewWriter(&buf)
-	if err := json.NewEncoder(zw).Encode(r); err != nil {
+	if err := v1.WriteJSON(zw, r); err != nil {
 		return nil, fmt.Errorf("encoding report: %w", err)
 	}
 	if err := zw.Close(); err != nil {
@@ -118,7 +135,7 @@ func (b *Buffer) Oldest() (Entry, bool, error) {
 	if err != nil {
 		return Entry{}, false, fmt.Errorf("reading buffered report %s: %w", f.name, err)
 	}
-	return Entry{Name: f.name, WindowStart: f.start, Body: body}, true, nil
+	return Entry{Name: f.name, WindowStart: f.start, WindowEnd: f.end, Body: body}, true, nil
 }
 
 // Remove deletes a sent or refused report.
@@ -142,7 +159,18 @@ func (b *Buffer) Len() (int, error) {
 type file struct {
 	name  string
 	start time.Time
+	end   time.Time
 	size  int64
+}
+
+func parseName(name string) (time.Time, time.Time, error) {
+	startText, endText, _ := strings.Cut(strings.TrimSuffix(name, suffix), "_")
+	start, err := time.Parse(nameTimeLayout, startText)
+	if err != nil {
+		return time.Time{}, time.Time{}, err
+	}
+	end, err := time.Parse(nameTimeLayout, endText)
+	return start, end, err
 }
 
 func (b *Buffer) listLocked() ([]file, error) {
@@ -156,7 +184,7 @@ func (b *Buffer) listLocked() ([]file, error) {
 		if e.IsDir() || !strings.HasSuffix(name, suffix) || strings.HasPrefix(name, ".") {
 			continue
 		}
-		start, err := time.Parse(nameTimeLayout, strings.SplitN(name, "_", 2)[0])
+		start, end, err := parseName(name)
 		if err != nil {
 			b.logger.Warn("ignoring a buffer file with an unexpected name", zap.String("file", name))
 			continue
@@ -165,7 +193,7 @@ func (b *Buffer) listLocked() ([]file, error) {
 		if err != nil {
 			return nil, fmt.Errorf("reading buffer entry %s: %w", name, err)
 		}
-		files = append(files, file{name: name, start: start, size: info.Size()})
+		files = append(files, file{name: name, start: start, end: end, size: info.Size()})
 	}
 	sort.Slice(files, func(i, j int) bool { return files[i].name < files[j].name })
 	return files, nil
@@ -210,7 +238,7 @@ func (b *Buffer) enforceLocked() error {
 // agent installation to the API, which refuses a second instance reporting the same cluster.
 func InstanceID(dataDir string) (string, error) {
 	path := filepath.Join(dataDir, instanceIDFile)
-	data, err := os.ReadFile(path)
+	data, err := os.ReadFile(path) //nolint:gosec // path is under the agent's own data directory
 	if err == nil {
 		if id := strings.TrimSpace(string(data)); id != "" {
 			return id, nil
@@ -226,6 +254,36 @@ func InstanceID(dataDir string) (string, error) {
 		return "", fmt.Errorf("writing %s: %w", path, err)
 	}
 	return id, nil
+}
+
+// ClusterID returns the cluster id SaveClusterID kept in dataDir/cluster-id, or "" when none is
+// kept.
+func ClusterID(dataDir string) (string, error) {
+	path := filepath.Join(dataDir, clusterIDFile)
+	data, err := os.ReadFile(path) //nolint:gosec // path is under the agent's own data directory
+	if errors.Is(err, os.ErrNotExist) {
+		return "", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("reading %s: %w", path, err)
+	}
+	return strings.TrimSpace(string(data)), nil
+}
+
+// SaveClusterID keeps the cluster the API token names, so a restart while the API is unreachable
+// reports for it. It replaces the file whole, so a crash never leaves a truncated id behind; the
+// one agent a volume belongs to is the only writer of its temporary file.
+func SaveClusterID(dataDir, id string) error {
+	path := filepath.Join(dataDir, clusterIDFile)
+	tmp := filepath.Join(dataDir, "."+clusterIDFile+".tmp")
+	if err := os.WriteFile(tmp, []byte(id+"\n"), 0o600); err != nil {
+		return fmt.Errorf("writing %s: %w", path, err)
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		_ = os.Remove(tmp)
+		return fmt.Errorf("writing %s: %w", path, err)
+	}
+	return nil
 }
 
 func newUUID() (string, error) {
