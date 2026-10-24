@@ -15,12 +15,20 @@ import (
 )
 
 const (
-	DefaultAPIEndpoint      = "https://api.costfluent.com"
-	DefaultDataDir          = "/data"
-	DefaultMetricsPort      = 9010
-	DefaultPollingInterval  = 60 * time.Second
-	MaxAllowedAnnotations   = 10
-	MaxAnnotationValueChars = 100
+	DefaultAPIEndpoint       = "https://api.costfluent.com"
+	DefaultDataDir           = "/data"
+	DefaultMetricsPort       = 9010
+	DefaultPollingInterval   = 60 * time.Second
+	MaxAllowedAnnotations    = 10
+	MaxAnnotationValueChars  = 100
+	DefaultKubeAPIQPS        = 50
+	DefaultKubeAPIBurst      = 100
+	DefaultOwnerCacheSize    = 20000
+	DefaultScrapeConcurrency = 20
+	maxScrapeConcurrency     = 200
+	maxKubeAPIQPS            = 1000
+	minOwnerCacheSize        = 100
+	maxOwnerCacheSize        = 1000000
 )
 
 // DefaultNodeAddressTypes is the order a node's addresses are tried in to reach its kubelet.
@@ -58,11 +66,27 @@ type Config struct {
 	ReportHTTPProxy        *url.URL
 	DataDir                string
 	MetricsPort            int
-	LogLevel               string
-	LogFormat              string
+	// KubeAPIQPS and KubeAPIBurst bound the agent's requests to the Kubernetes API server.
+	KubeAPIQPS   int
+	KubeAPIBurst int
+	// ScrapeConcurrency is the most kubelets scraped at once.
+	ScrapeConcurrency int
+	// OwnerCacheSize is how many resolved ReplicaSet and Job owners the agent remembers.
+	OwnerCacheSize int
+	// MemoryLimitBytes is the container's memory limit, which the chart passes in. Zero when unset.
+	MemoryLimitBytes int64
+	LogLevel         string
+	LogFormat        string
 
 	// Warnings are non-fatal findings the caller logs once a logger exists.
 	Warnings []string
+}
+
+// GoMemoryLimit is the soft limit the Go runtime keeps the agent's memory under: three quarters of
+// the container's limit, leaving the rest for what the runtime holds outside the heap. Zero means
+// no limit.
+func (c *Config) GoMemoryLimit() int64 {
+	return c.MemoryLimitBytes / 4 * 3
 }
 
 // Load reads the configuration from the process environment.
@@ -88,9 +112,9 @@ func load(lookup func(string) (string, bool)) (*Config, error) {
 	if cfg.Token == "" {
 		errs = append(errs, errors.New("COSTFLUENT_TOKEN is required: set agent.token or agent.secret.name in the chart"))
 	}
-	if cfg.ClusterID == "" {
-		errs = append(errs, errors.New("COSTFLUENT_CLUSTER_ID is required: set agent.clusterID in the chart"))
-	} else if !clusterIDPattern.MatchString(cfg.ClusterID) {
+	// Optional: the cluster token names its cluster, and the agent reads it from GET /v1/me at
+	// start. When set, it has to be that cluster's id.
+	if cfg.ClusterID != "" && !clusterIDPattern.MatchString(cfg.ClusterID) {
 		errs = append(errs, fmt.Errorf("COSTFLUENT_CLUSTER_ID %q must match %s", cfg.ClusterID, clusterIDPattern))
 	}
 
@@ -152,6 +176,52 @@ func load(lookup func(string) (string, bool)) (*Config, error) {
 			errs = append(errs, fmt.Errorf("COSTFLUENT_METRICS_PORT %q must be a port number", raw))
 		} else {
 			cfg.MetricsPort = port
+		}
+	}
+
+	cfg.KubeAPIQPS = DefaultKubeAPIQPS
+	if raw := get("COSTFLUENT_KUBE_API_QPS"); raw != "" {
+		qps, err := strconv.Atoi(raw)
+		if err != nil || qps < 1 || qps > maxKubeAPIQPS {
+			errs = append(errs, fmt.Errorf("COSTFLUENT_KUBE_API_QPS %q must be a whole number from 1 to %d", raw, maxKubeAPIQPS))
+		} else {
+			cfg.KubeAPIQPS = qps
+		}
+	}
+	cfg.KubeAPIBurst = max(DefaultKubeAPIBurst, cfg.KubeAPIQPS)
+	if raw := get("COSTFLUENT_KUBE_API_BURST"); raw != "" {
+		burst, err := strconv.Atoi(raw)
+		if err != nil || burst < cfg.KubeAPIQPS {
+			errs = append(errs, fmt.Errorf("COSTFLUENT_KUBE_API_BURST %q must be a whole number no lower than COSTFLUENT_KUBE_API_QPS (%d)", raw, cfg.KubeAPIQPS))
+		} else {
+			cfg.KubeAPIBurst = burst
+		}
+	}
+	cfg.ScrapeConcurrency = DefaultScrapeConcurrency
+	if raw := get("COSTFLUENT_SCRAPE_CONCURRENCY"); raw != "" {
+		n, err := strconv.Atoi(raw)
+		if err != nil || n < 1 || n > maxScrapeConcurrency {
+			errs = append(errs, fmt.Errorf("COSTFLUENT_SCRAPE_CONCURRENCY %q must be a whole number from 1 to %d", raw, maxScrapeConcurrency))
+		} else {
+			cfg.ScrapeConcurrency = n
+		}
+	}
+	cfg.OwnerCacheSize = DefaultOwnerCacheSize
+	if raw := get("COSTFLUENT_OWNER_CACHE_SIZE"); raw != "" {
+		size, err := strconv.Atoi(raw)
+		if err != nil || size < minOwnerCacheSize || size > maxOwnerCacheSize {
+			errs = append(errs, fmt.Errorf("COSTFLUENT_OWNER_CACHE_SIZE %q must be a whole number from %d to %d", raw, minOwnerCacheSize, maxOwnerCacheSize))
+		} else {
+			cfg.OwnerCacheSize = size
+		}
+	}
+
+	if raw := get("COSTFLUENT_MEMORY_LIMIT"); raw != "" {
+		limit, err := strconv.ParseInt(raw, 10, 64)
+		if err != nil || limit <= 0 {
+			errs = append(errs, fmt.Errorf("COSTFLUENT_MEMORY_LIMIT %q must be a number of bytes", raw))
+		} else {
+			cfg.MemoryLimitBytes = limit
 		}
 	}
 

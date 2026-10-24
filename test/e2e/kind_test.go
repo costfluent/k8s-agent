@@ -12,9 +12,11 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -22,7 +24,7 @@ import (
 )
 
 const (
-	token         = "cf_org_e2e-smoke-token"
+	token         = "cf_k8s_e2e-smoke-token"
 	clusterID     = "kind-e2e"
 	release       = "cfa"
 	agentImage    = "costfluent-e2e/k8s-agent"
@@ -32,9 +34,8 @@ const (
 	reportWithin  = 3 * time.Minute
 )
 
-// kindest/node for kind v0.33.0, the version the CI runner image pins. CI overrides it with the
-// Harbor proxy path (KIND_NODE_IMAGE); the default pulls upstream, because this module is also
-// published where Harbor cannot be reached.
+// kindest/node for kind v0.33.0. KIND_NODE_IMAGE overrides it, for example with a registry mirror
+// or another Kubernetes version; the default pulls upstream.
 const defaultNodeImage = "kindest/node:v1.37.0@sha256:a1ed56cfb0e7b93589bdf97c8cd566405a265939e3620fc4f5de89adff580ae5"
 
 func env(key, fallback string) string {
@@ -93,14 +94,18 @@ func TestKindSmoke(t *testing.T) {
 		t.Fatalf("no chart at %s (set E2E_CHART): %v", chart, err)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 14*time.Minute)
+	// A signal would otherwise kill the binary before t.Cleanup deletes the cluster: a test runner
+	// may send SIGTERM to stop a run early, and SIGPIPE arrives once the
+	// killed go command stops reading our output. Cancelling instead fails the test and cleans up.
+	signalled, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM, syscall.SIGPIPE)
+	defer stop()
+	ctx, cancel := context.WithTimeout(signalled, 14*time.Minute)
 	defer cancel()
 	dir := t.TempDir()
 	h := &harness{t: t, ctx: ctx, kubeconfig: filepath.Join(dir, "kubeconfig")}
-	cluster := env("KIND_CLUSTER_NAME", "costfluent-e2e")
+	// Per run, so concurrent runs on one Docker daemon do not collide.
+	cluster := env("KIND_CLUSTER_NAME", fmt.Sprintf("costfluent-e2e-%d", os.Getpid()))
 
-	h.run("kind", "create", "cluster", "--name", cluster, "--image", env("KIND_NODE_IMAGE", defaultNodeImage),
-		"--kubeconfig", h.kubeconfig, "--wait", "180s")
 	t.Cleanup(func() {
 		if os.Getenv("E2E_KEEP_CLUSTER") != "" {
 			t.Logf("keeping kind cluster %s (KUBECONFIG=%s)", cluster, h.kubeconfig)
@@ -111,6 +116,8 @@ func TestKindSmoke(t *testing.T) {
 			t.Logf("kind delete cluster: %v\n%s", err, out)
 		}
 	})
+	h.run("kind", "create", "cluster", "--name", cluster, "--image", env("KIND_NODE_IMAGE", defaultNodeImage),
+		"--kubeconfig", h.kubeconfig, "--wait", "180s")
 
 	receiverDir := filepath.Join(dir, "receiver")
 	build := exec.CommandContext(ctx, "go", "build", "-trimpath", "-o", filepath.Join(receiverDir, "receiver"), "./test/e2e/receiver")
@@ -137,7 +144,6 @@ func TestKindSmoke(t *testing.T) {
 	installed := time.Now()
 	h.run("helm", "install", release, chart, "--namespace", "costfluent", "--create-namespace",
 		"--set", "agent.token="+token,
-		"--set", "agent.clusterID="+clusterID,
 		"--set", "agent.apiEndpoint=http://receiver.e2e:8080",
 		"--set", "agent.pollingInterval=5",
 		// kind kubelets serve self-signed certificates.
@@ -167,6 +173,9 @@ func (h *harness) awaitReport(since time.Time) v1.Report {
 	var last string
 	for time.Since(since) < reportWithin {
 		time.Sleep(5 * time.Second)
+		if err := h.ctx.Err(); err != nil {
+			h.t.Fatalf("waiting for a report: %v", err)
+		}
 		raw, err := h.try("kubectl", "get", "--raw", "/api/v1/namespaces/e2e/services/receiver:8080/proxy/reports")
 		if err != nil {
 			last = raw

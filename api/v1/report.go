@@ -11,10 +11,9 @@ const SchemaVersion = 1
 
 // Node rate annotations. They are the only node annotations the agent sends.
 const (
-	AnnotationVCPUHourlyRate      = "costfluent.com/vcpu-hourly-rate"
-	AnnotationRAMGBHourlyRate     = "costfluent.com/ram-gb-hourly-rate"
-	AnnotationGPUHourlyRate       = "costfluent.com/gpu-hourly-rate"
-	AnnotationStorageGBHourlyRate = "costfluent.com/storage-gb-hourly-rate"
+	AnnotationVCPUHourlyRate  = "costfluent.com/vcpu-hourly-rate"
+	AnnotationRAMGBHourlyRate = "costfluent.com/ram-gb-hourly-rate"
+	AnnotationGPUHourlyRate   = "costfluent.com/gpu-hourly-rate"
 )
 
 // RateAnnotations lists the node annotations the agent forwards.
@@ -22,7 +21,6 @@ var RateAnnotations = []string{
 	AnnotationVCPUHourlyRate,
 	AnnotationRAMGBHourlyRate,
 	AnnotationGPUHourlyRate,
-	AnnotationStorageGBHourlyRate,
 }
 
 // Report is one aggregated window. Windows are UTC clock hours, except the
@@ -99,4 +97,12 @@ type Problem struct {
 	Title  string `json:"title,omitempty"`
 	Detail string `json:"detail,omitempty"`
 	Status int    `json:"status,omitempty"`
+	// Errors names each refused field and why.
+	Errors []ProblemError `json:"errors,omitempty"`
+}
+
+// ProblemError is one refused field of a Problem.
+type ProblemError struct {
+	Name   string `json:"name"`
+	Reason string `json:"reason"`
 }

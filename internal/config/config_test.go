@@ -87,7 +87,6 @@ func TestLoad_RejectsInvalidValues(t *testing.T) {
 	base := map[string]string{"COSTFLUENT_TOKEN": "t", "COSTFLUENT_CLUSTER_ID": "c"}
 	cases := map[string]map[string]string{
 		"missing token":            {"COSTFLUENT_TOKEN": ""},
-		"missing cluster":          {"COSTFLUENT_CLUSTER_ID": ""},
 		"cluster leading dot":      {"COSTFLUENT_CLUSTER_ID": ".abc"},
 		"cluster too long":         {"COSTFLUENT_CLUSTER_ID": strings.Repeat("a", 64)},
 		"cluster slash":            {"COSTFLUENT_CLUSTER_ID": "a/b"},
@@ -120,10 +119,91 @@ func TestLoad_RejectsInvalidValues(t *testing.T) {
 	}
 }
 
+// The cluster token names its cluster, so the chart may leave agent.clusterID out.
+func TestLoad_ClusterIDIsOptional(t *testing.T) {
+	cfg, err := load(env(map[string]string{"COSTFLUENT_TOKEN": "t"}))
+	if err != nil || cfg.ClusterID != "" {
+		t.Fatalf("got cluster %q, err %v; want no cluster and no error", cfg.ClusterID, err)
+	}
+}
+
 func TestLoad_AcceptsLongestClusterID(t *testing.T) {
 	id := strings.Repeat("a", 63)
 	cfg, err := load(env(map[string]string{"COSTFLUENT_TOKEN": "t", "COSTFLUENT_CLUSTER_ID": id}))
 	if err != nil || cfg.ClusterID != id {
 		t.Fatalf("got %v, %v", cfg, err)
+	}
+}
+
+func TestLoad_ReadsTheContainerMemoryLimit(t *testing.T) {
+	base := map[string]string{"COSTFLUENT_TOKEN": "t", "COSTFLUENT_CLUSTER_ID": "c"}
+	cfg, err := load(env(base))
+	if err != nil || cfg.MemoryLimitBytes != 0 || cfg.GoMemoryLimit() != 0 {
+		t.Fatalf("unset limit = %d, soft %d, %v; want none", cfg.MemoryLimitBytes, cfg.GoMemoryLimit(), err)
+	}
+	base["COSTFLUENT_MEMORY_LIMIT"] = "268435456"
+	cfg, err = load(env(base))
+	if err != nil || cfg.MemoryLimitBytes != 256<<20 || cfg.GoMemoryLimit() != 192<<20 {
+		t.Fatalf("limit = %d, soft %d, %v; want 256 MiB and a 192 MiB soft limit", cfg.MemoryLimitBytes, cfg.GoMemoryLimit(), err)
+	}
+	for _, bad := range []string{"256Mi", "0", "-1", "lots"} {
+		base["COSTFLUENT_MEMORY_LIMIT"] = bad
+		if _, err := load(env(base)); err == nil || !strings.Contains(err.Error(), "COSTFLUENT_MEMORY_LIMIT") {
+			t.Errorf("COSTFLUENT_MEMORY_LIMIT=%q: err = %v, want it refused", bad, err)
+		}
+	}
+}
+
+func TestLoad_ReadsTheAPIRateAndOwnerCacheSize(t *testing.T) {
+	base := map[string]string{"COSTFLUENT_TOKEN": "t", "COSTFLUENT_CLUSTER_ID": "c"}
+	cfg, err := load(env(base))
+	if err != nil || cfg.KubeAPIQPS != DefaultKubeAPIQPS || cfg.KubeAPIBurst != DefaultKubeAPIBurst || cfg.OwnerCacheSize != DefaultOwnerCacheSize {
+		t.Fatalf("defaults = %d %d %d, %v", cfg.KubeAPIQPS, cfg.KubeAPIBurst, cfg.OwnerCacheSize, err)
+	}
+	set := map[string]string{"COSTFLUENT_KUBE_API_QPS": "20", "COSTFLUENT_KUBE_API_BURST": "40", "COSTFLUENT_OWNER_CACHE_SIZE": "5000"}
+	for k, v := range set {
+		base[k] = v
+	}
+	cfg, err = load(env(base))
+	if err != nil || cfg.KubeAPIQPS != 20 || cfg.KubeAPIBurst != 40 || cfg.OwnerCacheSize != 5000 {
+		t.Fatalf("set = %d %d %d, %v", cfg.KubeAPIQPS, cfg.KubeAPIBurst, cfg.OwnerCacheSize, err)
+	}
+	for name, override := range map[string]map[string]string{
+		"qps zero":           {"COSTFLUENT_KUBE_API_QPS": "0"},
+		"qps too high":       {"COSTFLUENT_KUBE_API_QPS": "1001"},
+		"qps not a number":   {"COSTFLUENT_KUBE_API_QPS": "fast"},
+		"burst below qps":    {"COSTFLUENT_KUBE_API_BURST": "10"},
+		"burst not a number": {"COSTFLUENT_KUBE_API_BURST": "x"},
+		"cache too small":    {"COSTFLUENT_OWNER_CACHE_SIZE": "99"},
+		"cache too large":    {"COSTFLUENT_OWNER_CACHE_SIZE": "1000001"},
+		"cache not a number": {"COSTFLUENT_OWNER_CACHE_SIZE": "lots"},
+	} {
+		values := map[string]string{}
+		for k, v := range base {
+			values[k] = v
+		}
+		for k, v := range override {
+			values[k] = v
+		}
+		if _, err := load(env(values)); err == nil {
+			t.Errorf("%s: accepted %v", name, override)
+		}
+	}
+}
+
+func TestLoad_ReadsTheScrapeConcurrency(t *testing.T) {
+	base := map[string]string{"COSTFLUENT_TOKEN": "t", "COSTFLUENT_CLUSTER_ID": "c"}
+	if cfg, err := load(env(base)); err != nil || cfg.ScrapeConcurrency != 20 {
+		t.Fatalf("default = %v, %v; want 20", cfg, err)
+	}
+	base["COSTFLUENT_SCRAPE_CONCURRENCY"] = "50"
+	if cfg, err := load(env(base)); err != nil || cfg.ScrapeConcurrency != 50 {
+		t.Fatalf("set = %v, %v; want 50", cfg, err)
+	}
+	for _, bad := range []string{"0", "201", "many"} {
+		base["COSTFLUENT_SCRAPE_CONCURRENCY"] = bad
+		if _, err := load(env(base)); err == nil {
+			t.Errorf("COSTFLUENT_SCRAPE_CONCURRENCY=%q accepted", bad)
+		}
 	}
 }

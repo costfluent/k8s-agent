@@ -1,15 +1,18 @@
 package collector
 
 import (
+	"bufio"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"time"
 
 	v1 "github.com/costfluent/k8s-agent/api/v1"
+	"github.com/costfluent/k8s-agent/internal/metrics"
 )
 
 // FirstWindow is how long the window opened at a fresh start runs, so an install shows a report
@@ -22,13 +25,30 @@ type Observation struct {
 	Nodes []v1.Node
 	Pods  []PodInfo
 	Usage map[ContainerKey]ContainerUsage
+	// Unscraped names the nodes whose kubelet scrape failed: their usage is unknown, so the poll
+	// did not observe them or their pods.
+	Unscraped map[string]bool
+	// Duration is how long the poll took to collect.
+	Duration time.Duration
 }
 
 type podKey struct{ namespace, name, node string }
 
 type podAccum struct {
 	pod        v1.Pod
-	containers map[string]*v1.Container
+	containers []v1.Container
+}
+
+// container returns the accumulator for the named container, adding it on first sight. Pods have
+// few containers, so a scan is cheaper than a map per pod.
+func (acc *podAccum) container(name string) *v1.Container {
+	for i := range acc.containers {
+		if acc.containers[i].Name == name {
+			return &acc.containers[i]
+		}
+	}
+	acc.containers = append(acc.containers, v1.Container{Name: name})
+	return &acc.containers[len(acc.containers)-1]
 }
 
 // Aggregator integrates observations into seconds-weighted sums per window. It is not safe for
@@ -37,10 +57,11 @@ type Aggregator struct {
 	clusterID, version, instanceID string
 	interval                       time.Duration
 
-	start, end time.Time
-	lastSample time.Time
-	nodes      map[string]*v1.Node
-	pods       map[podKey]*podAccum
+	start, end   time.Time
+	lastSample   time.Time
+	lastDuration time.Duration
+	nodes        map[string]*v1.Node
+	pods         map[podKey]*podAccum
 }
 
 // NewAggregator opens the short first window at now. interval is the polling interval, used to
@@ -66,18 +87,22 @@ func (a *Aggregator) open(start, end time.Time) {
 func (a *Aggregator) Observe(obs Observation) []v1.Report {
 	now := obs.Time.UTC()
 	if a.lastSample.IsZero() {
-		a.lastSample = maxTime(now, a.start)
+		a.lastSample, a.lastDuration = maxTime(now, a.start), obs.Duration
 		return a.closeUntil(now)
 	}
 	elapsed := now.Sub(a.lastSample)
 	if elapsed <= 0 {
 		return nil
 	}
-	// A gap of several intervals is time the agent did not observe; it counts as one interval.
-	if elapsed > 3*a.interval {
+	metrics.ElapsedSeconds.Add(elapsed.Seconds())
+	// A slow poll delays the next one, and that time was observed. A gap longer than the last poll
+	// plus an interval, and than three intervals, is polls that failed or were missed: time the agent
+	// did not observe, which counts as one interval.
+	if elapsed > max(3*a.interval, a.lastDuration+a.interval) {
 		elapsed = a.interval
 	}
-	a.lastSample = now
+	metrics.CreditedSeconds.Add(elapsed.Seconds())
+	a.lastSample, a.lastDuration = now, obs.Duration
 
 	var closed []v1.Report
 	for from := now.Add(-elapsed); from.Before(now); {
@@ -118,6 +143,9 @@ func (a *Aggregator) apply(obs Observation, seconds float64) {
 		return
 	}
 	for _, n := range obs.Nodes {
+		if obs.Unscraped[n.Name] {
+			continue
+		}
 		acc, ok := a.nodes[n.Name]
 		observed := 0.0
 		if ok {
@@ -128,20 +156,19 @@ func (a *Aggregator) apply(obs Observation, seconds float64) {
 		a.nodes[n.Name] = &node
 	}
 	for _, p := range obs.Pods {
+		if obs.Unscraped[p.Node] {
+			continue
+		}
 		key := podKey{p.Namespace, p.Name, p.Node}
 		acc, ok := a.pods[key]
 		if !ok {
-			acc = &podAccum{containers: map[string]*v1.Container{}}
+			acc = &podAccum{containers: make([]v1.Container, 0, len(p.Specs))}
 			a.pods[key] = acc
 		}
 		acc.pod = p.Pod
 		acc.pod.Containers = nil
 		for _, spec := range p.Specs {
-			c, ok := acc.containers[spec.Name]
-			if !ok {
-				c = &v1.Container{Name: spec.Name}
-				acc.containers[spec.Name] = c
-			}
+			c := acc.container(spec.Name)
 			c.CPURequestCores = spec.CPURequestCores
 			c.MemoryRequestBytes = spec.MemoryRequestBytes
 			c.GPURequest = spec.GPURequest
@@ -180,10 +207,7 @@ func (a *Aggregator) report(end time.Time) (v1.Report, bool) {
 	sort.Slice(r.Nodes, func(i, j int) bool { return r.Nodes[i].Name < r.Nodes[j].Name })
 	for _, acc := range a.pods {
 		p := acc.pod
-		p.Containers = make([]v1.Container, 0, len(acc.containers))
-		for _, c := range acc.containers {
-			p.Containers = append(p.Containers, *c)
-		}
+		p.Containers = slices.Clone(acc.containers)
 		sort.Slice(p.Containers, func(i, j int) bool { return p.Containers[i].Name < p.Containers[j].Name })
 		r.Pods = append(r.Pods, p)
 	}
@@ -206,14 +230,11 @@ type snapshot struct {
 }
 
 // SaveSnapshot writes the open window to path atomically, so a crash loses at most the time since.
+// The report streams to the file, so the encoded window is never held in memory whole.
 func (a *Aggregator) SaveSnapshot(path string) error {
 	r, _ := a.report(a.end)
-	data, err := json.Marshal(snapshot{LastSample: a.lastSample, Report: r})
-	if err != nil {
-		return fmt.Errorf("encoding window snapshot: %w", err)
-	}
 	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o600); err != nil {
+	if err := writeSnapshot(tmp, a.lastSample, r); err != nil {
 		return fmt.Errorf("writing window snapshot: %w", err)
 	}
 	if err := os.Rename(tmp, path); err != nil {
@@ -222,10 +243,37 @@ func (a *Aggregator) SaveSnapshot(path string) error {
 	return nil
 }
 
+func writeSnapshot(path string, lastSample time.Time, r v1.Report) (err error) {
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600) //nolint:gosec // path is under the agent's own data directory
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if cerr := f.Close(); err == nil {
+			err = cerr
+		}
+	}()
+	w := bufio.NewWriterSize(f, 64<<10)
+	sample, err := json.Marshal(lastSample)
+	if err != nil {
+		return err
+	}
+	if _, err := fmt.Fprintf(w, `{"last_sample":%s,"report":`, sample); err != nil {
+		return err
+	}
+	if err := v1.WriteJSON(w, r); err != nil {
+		return err
+	}
+	if _, err := w.WriteString("}"); err != nil {
+		return err
+	}
+	return w.Flush()
+}
+
 // RestoreSnapshot loads the window saved at path. A window still open at now is resumed; one that
 // closed while the agent was down is returned as a report. The file is removed either way.
 func (a *Aggregator) RestoreSnapshot(path string, now time.Time) (*v1.Report, error) {
-	data, err := os.ReadFile(path)
+	data, err := os.ReadFile(path) //nolint:gosec // path is under the agent's own data directory
 	if errors.Is(err, os.ErrNotExist) {
 		return nil, nil
 	}
@@ -256,11 +304,7 @@ func (a *Aggregator) RestoreSnapshot(path string, now time.Time) (*v1.Report, er
 		a.nodes[n.Name] = &n
 	}
 	for _, p := range r.Pods {
-		acc := &podAccum{pod: p, containers: map[string]*v1.Container{}}
-		for i := range p.Containers {
-			c := p.Containers[i]
-			acc.containers[c.Name] = &c
-		}
+		acc := &podAccum{pod: p, containers: p.Containers}
 		acc.pod.Containers = nil
 		a.pods[podKey{p.Namespace, p.Name, p.Node}] = acc
 	}

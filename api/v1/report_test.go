@@ -9,7 +9,7 @@ import (
 	"time"
 )
 
-var update = flag.Bool("update", false, "rewrite testdata/report.json")
+var update = flag.Bool("update", false, "rewrite the golden files in testdata")
 
 func goldenReport() Report {
 	start := time.Date(2026, 9, 23, 10, 0, 0, 0, time.UTC)
@@ -137,7 +137,7 @@ func TestReport_MatchesGoldenFile(t *testing.T) {
 		t.Fatal(err)
 	}
 	if !bytes.Equal(got, want) {
-		t.Fatalf("report.json drifted from the contract; run go test ./api/v1 -update and change the backend in the same commit\n got: %s", got)
+		t.Fatalf("report.json drifted from the contract; run go test ./api/v1 -update once the Costfluent API accepts the change\n got: %s", got)
 	}
 }
 
