@@ -1,8 +1,11 @@
 package collector
 
 import (
+	"fmt"
 	"math"
+	"os"
 	"path/filepath"
+	"reflect"
 	"testing"
 	"time"
 
@@ -89,6 +92,34 @@ func TestAggregator_AllocatesMaxOfRequestAndUsage(t *testing.T) {
 	start, end = a.Window()
 	if !start.Equal(t0.Add(2*time.Minute)) || !end.Equal(time.Date(2026, 9, 23, 11, 0, 0, 0, time.UTC)) {
 		t.Fatalf("second window = %s..%s", start, end)
+	}
+}
+
+func TestAggregator_SendsEachContainersGPURequests(t *testing.T) {
+	a := NewAggregator("c", "0.4.0", "id", 10*time.Second, t0)
+	pod := webPod("n1")
+	pod.Specs[0].GPURequest = 1
+	pod.Specs[0].GPURequests = map[string]int{"nvidia.com/gpu": 1, "nvidia.com/mig-1g.5gb": 2}
+	pods := []PodInfo{pod}
+
+	var closed []v1.Report
+	for i := 0; i <= 12; i++ {
+		closed = append(closed, a.Observe(obsAt(t0.Add(time.Duration(i)*10*time.Second), []string{"n1"}, pods, nil))...)
+	}
+
+	if len(closed) != 1 {
+		t.Fatalf("closed %d windows, want 1", len(closed))
+	}
+	p := findPod(closed[0], "web-0", "n1")
+	if p == nil || len(p.Containers) != 2 {
+		t.Fatalf("pod = %+v", p)
+	}
+	app, side := p.Containers[0], p.Containers[1]
+	if app.GPURequest != 1 || !reflect.DeepEqual(app.GPURequests, map[string]int{"nvidia.com/gpu": 1, "nvidia.com/mig-1g.5gb": 2}) {
+		t.Errorf("app gpu = %d %v", app.GPURequest, app.GPURequests)
+	}
+	if side.GPURequests != nil {
+		t.Errorf("a container without GPUs sends gpu_requests %v", side.GPURequests)
 	}
 }
 
@@ -223,6 +254,108 @@ func TestAggregator_SnapshotOfAClosedWindowBecomesAReport(t *testing.T) {
 	}
 }
 
+// restoreDiscards restores path into a fresh aggregator for cluster at now, and fails unless the
+// snapshot was dropped: no report, no error, the file gone and the fresh window still open.
+func restoreDiscards(t *testing.T, cluster, path string, now time.Time) *Aggregator {
+	t.Helper()
+	b := NewAggregator(cluster, "v", "id", 60*time.Second, now)
+	closed, err := b.RestoreSnapshot(path, now)
+	if err != nil || closed != nil {
+		t.Fatalf("restore = %+v %v, want the snapshot discarded", closed, err)
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("%s still exists after a discard: %v", path, err)
+	}
+	if start, end := b.Window(); !start.Equal(now) || !end.Equal(now.Add(FirstWindow)) {
+		t.Fatalf("window = %s..%s, want the fresh %s..%s", start, end, now, now.Add(FirstWindow))
+	}
+	return b
+}
+
+// A new token can move an agent to another cluster while its data volume still holds the old
+// cluster's window. That window must neither be resumed under the new cluster ID, which would
+// credit the old cluster's usage to the new one, nor be returned for sending, which the API
+// refuses for the new token.
+func TestAggregator_SnapshotOfAnotherClusterIsDiscarded(t *testing.T) {
+	for _, saved := range []struct{ name, cluster string }{
+		{"another cluster", "a"},
+		{"no cluster ID", ""},
+	} {
+		save := func(t *testing.T) string {
+			path := filepath.Join(t.TempDir(), "window.json")
+			a := NewAggregator(saved.cluster, "v", "id", 60*time.Second, t0)
+			a.Observe(obsAt(t0, []string{"n1"}, []PodInfo{webPod("n1")}, nil))
+			a.Observe(obsAt(t0.Add(time.Minute), []string{"n1"}, []PodInfo{webPod("n1")}, nil))
+			if err := a.SaveSnapshot(path); err != nil {
+				t.Fatal(err)
+			}
+			return path
+		}
+
+		t.Run(saved.name+"/inside the window", func(t *testing.T) {
+			now := t0.Add(90 * time.Second)
+			b := restoreDiscards(t, "b", save(t), now)
+			b.Observe(obsAt(now, []string{"n1"}, []PodInfo{webPod("n1")}, nil))
+			closed := b.Observe(obsAt(now.Add(FirstWindow), []string{"n1"}, []PodInfo{webPod("n1")}, nil))
+			if len(closed) != 1 || closed[0].ClusterID != "b" || !closed[0].WindowStart.Equal(now) {
+				t.Fatalf("closed = %+v, want one window of cluster b from %s", closed, now)
+			}
+			if n := closed[0].Nodes; len(n) != 1 || !near(n[0].ObservedSeconds, FirstWindow.Seconds()) {
+				t.Fatalf("nodes = %+v, want only the %v observed after the restart", n, FirstWindow)
+			}
+			if p := findPod(closed[0], "web-0", "n1"); p == nil || !near(p.Containers[0].ObservedSeconds, FirstWindow.Seconds()) {
+				t.Fatalf("pod = %+v, want only the %v observed after the restart", p, FirstWindow)
+			}
+		})
+
+		t.Run(saved.name+"/after the window closed", func(t *testing.T) {
+			restoreDiscards(t, "b", save(t), t0.Add(3*time.Hour))
+		})
+	}
+}
+
+// Every node of a window can go unscraped while storage is still read, so a saved window can hold
+// volumes and no node. The aggregator never reports a window without a node, so such a window is
+// neither resumed nor returned.
+func TestAggregator_SnapshotWithNoNodesRestoresNothing(t *testing.T) {
+	pvc := v1.Volume{Name: "pvc-1", CapacityBytes: 1 << 30, Phase: "Bound", ClaimNamespace: "shop", ClaimName: "data-web-0"}
+	observe := func(a *Aggregator, at time.Time, scraped bool) []v1.Report {
+		obs := obsAt(at, []string{"n1"}, []PodInfo{webPod("n1")}, nil)
+		obs.Volumes = []v1.Volume{pvc}
+		if !scraped {
+			obs.Unscraped = map[string]bool{"n1": true}
+		}
+		return a.Observe(obs)
+	}
+	save := func(t *testing.T) string {
+		path := filepath.Join(t.TempDir(), "window.json")
+		a := NewAggregator("c", "v", "id", 60*time.Second, t0)
+		observe(a, t0, false)
+		observe(a, t0.Add(time.Minute), false)
+		if err := a.SaveSnapshot(path); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+
+	t.Run("inside the window", func(t *testing.T) {
+		now := t0.Add(90 * time.Second)
+		b := restoreDiscards(t, "c", save(t), now)
+		observe(b, now, true)
+		closed := observe(b, now.Add(FirstWindow), true)
+		if len(closed) != 1 || !closed[0].WindowStart.Equal(now) {
+			t.Fatalf("closed = %+v, want one window from %s", closed, now)
+		}
+		if v := closed[0].Volumes; len(v) != 1 || !near(v[0].ObservedSeconds, FirstWindow.Seconds()) {
+			t.Fatalf("volumes = %+v, want only the %v observed after the restart", v, FirstWindow)
+		}
+	})
+
+	t.Run("after the window closed", func(t *testing.T) {
+		restoreDiscards(t, "c", save(t), t0.Add(3*time.Hour))
+	})
+}
+
 func apiPod(node string) PodInfo {
 	return PodInfo{
 		Pod:   v1.Pod{Namespace: "shop", Name: "api-0", Node: node},
@@ -305,5 +438,65 @@ func TestAggregator_WhenEveryScrapeFailsNothingIsObserved(t *testing.T) {
 		if c := p.Containers[0]; !near(c.ObservedSeconds, 20) || !near(c.CPUUsageCoreSeconds, 0.8*20) {
 			t.Errorf("%s/%s = %+v, want the 20 scraped seconds at measured usage", p.Name, c.Name, c)
 		}
+	}
+}
+
+func TestAggregator_SnapshotKeepsVolumesAndClaims(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "window.json")
+	pod := webPod("n1")
+	pod.Claims = []string{"data-web-0"}
+	observe := func(a *Aggregator, at time.Time) []v1.Report {
+		obs := obsAt(at, []string{"n1"}, []PodInfo{pod}, nil)
+		obs.Volumes = []v1.Volume{{Name: "pvc-1", CapacityBytes: 1 << 30, Phase: "Bound", ClaimNamespace: "shop", ClaimName: "data-web-0"}}
+		return a.Observe(obs)
+	}
+	a := NewAggregator("c", "v", "id", 60*time.Second, t0)
+	observe(a, t0)
+	observe(a, t0.Add(time.Minute))
+	if err := a.SaveSnapshot(path); err != nil {
+		t.Fatal(err)
+	}
+
+	b := NewAggregator("c", "v", "id", 60*time.Second, t0.Add(90*time.Second))
+	if closed, err := b.RestoreSnapshot(path, t0.Add(90*time.Second)); err != nil || closed != nil {
+		t.Fatalf("restore = %v %v", closed, err)
+	}
+	observe(b, t0.Add(100*time.Second))
+	closed := observe(b, t0.Add(120*time.Second))
+	if len(closed) != 1 || len(closed[0].Volumes) != 1 || !near(closed[0].Volumes[0].ObservedSeconds, 80) {
+		t.Fatalf("restored volumes = %+v, want pvc-1 observed 60s before the restart and 20s after", closed)
+	}
+	if p := findPod(closed[0], "web-0", "n1"); p == nil || !reflect.DeepEqual(p.Claims, []string{"data-web-0"}) {
+		t.Fatalf("restored pod = %+v, want its claim", p)
+	}
+}
+
+func TestAggregator_SendsTheFirstVolumesByNamePastTheCap(t *testing.T) {
+	vols := make([]v1.Volume, 0, v1.MaxVolumes+2)
+	for i := v1.MaxVolumes + 1; i >= 0; i-- {
+		vols = append(vols, v1.Volume{Name: fmt.Sprintf("pvc-%06d", i), Phase: "Available"})
+	}
+	before := testutil.ToFloat64(metrics.VolumesDropped)
+	a := NewAggregator("c", "v", "id", 10*time.Second, t0)
+	for i := range 2 {
+		obs := obsAt(t0.Add(time.Duration(i)*10*time.Second), []string{"n1"}, nil, nil)
+		obs.Volumes = vols
+		a.Observe(obs)
+	}
+	if err := a.SaveSnapshot(filepath.Join(t.TempDir(), "window.json")); err != nil {
+		t.Fatal(err)
+	}
+	r, ok := a.Finish(t0.Add(10 * time.Second))
+	if !ok || len(r.Volumes) != v1.MaxVolumes {
+		t.Fatalf("sent %d volumes, want the cap %d", len(r.Volumes), v1.MaxVolumes)
+	}
+	if r.Volumes[0].Name != "pvc-000000" || r.Volumes[v1.MaxVolumes-1].Name != fmt.Sprintf("pvc-%06d", v1.MaxVolumes-1) {
+		t.Errorf("sent %s..%s, want the first by name", r.Volumes[0].Name, r.Volumes[v1.MaxVolumes-1].Name)
+	}
+	if err := r.CheckSize(); err != nil {
+		t.Errorf("a window past the volume cap is held back: %v", err)
+	}
+	if d := testutil.ToFloat64(metrics.VolumesDropped) - before; d != 2 {
+		t.Errorf("volumes dropped = %v, want 2, counted when the window closes and not at its snapshot", d)
 	}
 }

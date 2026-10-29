@@ -175,6 +175,13 @@ func mapsFit(r v1.Report) error {
 			return err
 		}
 	}
+	for _, v := range r.Volumes {
+		for what, m := range map[string]map[string]string{"class annotations": v.StorageClassAnnotations, "claim labels": v.ClaimLabels} {
+			if err := check("volume "+v.Name+" "+what, m); err != nil {
+				return err
+			}
+		}
+	}
 	for _, p := range r.Pods {
 		for what, m := range map[string]map[string]string{"labels": p.Labels, "annotations": p.Annotations, "namespace labels": p.NamespaceLabels} {
 			if err := check("pod "+p.Name+" "+what, m); err != nil {
@@ -240,6 +247,15 @@ func TestLoad_AgentAtTheAPICaps(t *testing.T) {
 		t.Fatal(err)
 	}
 	syncTook := time.Since(syncStart)
+	// Storage syncs beside nodes and pods rather than before them; the polls measured here read it.
+	for deadline := time.Now().Add(time.Minute); ; time.Sleep(10 * time.Millisecond) {
+		if _, ok := metadata.Volumes(ctx); ok {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the storage informers did not sync within a minute")
+		}
+	}
 	kubeletClient := &http.Client{Transport: &http.Transport{DialContext: kube.dial, TLSClientConfig: &tls.Config{InsecureSkipVerify: true}, MaxIdleConnsPerHost: 2}}
 	kubelet := collector.NewKubeletCollector(kubeletClient, []corev1.NodeAddressType{corev1.NodeInternalIP}, cfg.ScrapeConcurrency, zap.NewNop())
 	scrapeErrorsBefore := testutil.ToFloat64(agentmetrics.NodeScrapes.WithLabelValues("error"))
@@ -329,8 +345,8 @@ func TestLoad_AgentAtTheAPICaps(t *testing.T) {
 		peakHeap = max(peakHeap, p.bytes)
 	}
 	t.Logf("heap retained after the run %.1f MiB", mib(retained))
-	t.Logf("report: %d nodes, %d pod entries; %.1f MiB decompressed, %.2f MiB gzip; %.0f bytes per pod entry",
-		len(closed.Nodes), len(closed.Pods), mib(uint64(rc.decompressed)), mib(uint64(rc.compressed)),
+	t.Logf("report: %d nodes, %d pod entries, %d volumes; %.1f MiB decompressed, %.2f MiB gzip; %.0f bytes per pod entry",
+		len(closed.Nodes), len(closed.Pods), len(closed.Volumes), mib(uint64(rc.decompressed)), mib(uint64(rc.compressed)),
 		float64(rc.decompressed-len(podless))/float64(max(len(closed.Pods), 1)))
 	t.Logf("credited %.0f s of a %.0f s window (%.1f%%); window closed by a poll: %v", credited, wall, 100*credited/wall, windowClosed)
 
@@ -345,6 +361,21 @@ func TestLoad_AgentAtTheAPICaps(t *testing.T) {
 	}
 	if !windowClosed || credited < minCreditedShare*wall {
 		t.Errorf("credited %.0f s of %.0f s wall, under %.0f%%", credited, wall, 100*minCreditedShare)
+	}
+	claimed := map[string]bool{}
+	for _, p := range closed.Pods {
+		for _, c := range p.Claims {
+			claimed[p.Namespace+"/"+c] = true
+		}
+	}
+	if len(closed.Volumes) != statefulSetPods || len(claimed) != statefulSetPods {
+		t.Errorf("report carries %d volumes and %d claimed by pods, want one for each of the %d StatefulSet pods", len(closed.Volumes), len(claimed), statefulSetPods)
+	}
+	for _, v := range closed.Volumes {
+		if v.Phase != "Bound" || v.VolumeHandle == "" || v.ObservedSeconds <= 0 || !claimed[v.ClaimNamespace+"/"+v.ClaimName] {
+			t.Errorf("volume %+v is not a bound EBS volume observed in the window and mounted by its pod", v)
+			break
+		}
 	}
 	if n := testutil.ToFloat64(agentmetrics.NodeScrapes.WithLabelValues("error")) - scrapeErrorsBefore; n > 0 {
 		t.Errorf("%v kubelet scrapes failed", n)

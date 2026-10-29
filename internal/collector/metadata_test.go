@@ -18,10 +18,12 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
+	storagev1 "k8s.io/api/storage/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes/fake"
 	"k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/cache"
 
 	v1 "github.com/costfluent/k8s-agent/api/v1"
 	"github.com/costfluent/k8s-agent/internal/config"
@@ -43,7 +45,18 @@ func runningPod(ns, name, node string, owners []metav1.OwnerReference, labels, a
 
 func startMetadata(t *testing.T, cfg *config.Config, objects ...interface{ GetName() string }) *Metadata {
 	t.Helper()
+	m, _ := startMetadataWith(t, cfg, nil, objects...)
+	return m
+}
+
+// startMetadataWith starts the informers over a fake API server holding objects, after prepare,
+// when given, has added its reactors.
+func startMetadataWith(t *testing.T, cfg *config.Config, prepare func(*fake.Clientset), objects ...interface{ GetName() string }) (*Metadata, *fake.Clientset) {
+	t.Helper()
 	client := fake.NewClientset()
+	if prepare != nil {
+		prepare(client)
+	}
 	for _, o := range objects {
 		var err error
 		switch obj := o.(type) {
@@ -57,6 +70,12 @@ func startMetadata(t *testing.T, cfg *config.Config, objects ...interface{ GetNa
 			_, err = client.AppsV1().ReplicaSets(obj.Namespace).Create(context.Background(), obj, metav1.CreateOptions{})
 		case *batchv1.Job:
 			_, err = client.BatchV1().Jobs(obj.Namespace).Create(context.Background(), obj, metav1.CreateOptions{})
+		case *corev1.PersistentVolume:
+			_, err = client.CoreV1().PersistentVolumes().Create(context.Background(), obj, metav1.CreateOptions{})
+		case *corev1.PersistentVolumeClaim:
+			_, err = client.CoreV1().PersistentVolumeClaims(obj.Namespace).Create(context.Background(), obj, metav1.CreateOptions{})
+		case *storagev1.StorageClass:
+			_, err = client.StorageV1().StorageClasses().Create(context.Background(), obj, metav1.CreateOptions{})
 		default:
 			t.Fatalf("unsupported object %T", o)
 		}
@@ -70,7 +89,12 @@ func startMetadata(t *testing.T, cfg *config.Config, objects ...interface{ GetNa
 	if err := m.Start(ctx); err != nil {
 		t.Fatal(err)
 	}
-	return m
+	// Start does not wait for storage. A test that adds a reactor once Start returns would race the
+	// storage informers' first list in the fake client's reactor chain.
+	if !cache.WaitForCacheSync(ctx.Done(), m.storage.synced...) {
+		t.Fatal("the storage informers did not sync")
+	}
+	return m, client
 }
 
 func TestConvertNode_SendsOnlyTheRateAnnotations(t *testing.T) {
@@ -84,9 +108,10 @@ func TestConvertNode_SendsOnlyTheRateAnnotations(t *testing.T) {
 				"eks.amazonaws.com/capacityType":   "SPOT",
 			},
 			Annotations: map[string]string{
-				v1.AnnotationVCPUHourlyRate: "0.02",
-				"secret.example.com/config": "do-not-send",
-				// Persistent-volume cost is not a feature, and the backend never read this rate.
+				v1.AnnotationVCPUHourlyRate:   "0.02",
+				v1.AnnotationPhysicalGPUCount: "1",
+				"secret.example.com/config":   "do-not-send",
+				// The storage rate is read from a volume's storage class, never from a node.
 				"costfluent.com/storage-gb-hourly-rate": "0.0001",
 			},
 		},
@@ -110,7 +135,7 @@ func TestConvertNode_SendsOnlyTheRateAnnotations(t *testing.T) {
 	if n.CapacityCPUCores != 2 || n.AllocatableCPUCores != 1.93 || n.CapacityMemoryBytes != 8<<30 || n.CapacityGPU != 1 {
 		t.Errorf("shape = %+v", n)
 	}
-	if len(n.Annotations) != 1 || n.Annotations[v1.AnnotationVCPUHourlyRate] != "0.02" {
+	if len(n.Annotations) != 2 || n.Annotations[v1.AnnotationVCPUHourlyRate] != "0.02" || n.Annotations[v1.AnnotationPhysicalGPUCount] != "1" {
 		t.Errorf("annotations = %v", n.Annotations)
 	}
 }
@@ -405,5 +430,145 @@ func TestMetadata_PodsCollectNativeSidecarsAndNoOtherInitContainers(t *testing.T
 		if !slices.Equal(got, names) {
 			t.Errorf("pod %s reports containers %v, want %v", name, got, names)
 		}
+	}
+}
+
+func TestConvertNode_ReadsEachGPUResourceFamily(t *testing.T) {
+	node := &corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{Name: "gpu-1"},
+		Status: corev1.NodeStatus{
+			Capacity: corev1.ResourceList{
+				corev1.ResourceCPU:                     resource.MustParse("32"),
+				corev1.ResourceMemory:                  resource.MustParse("256Gi"),
+				corev1.ResourcePods:                    resource.MustParse("110"),
+				"nvidia.com/gpu":                       resource.MustParse("2"),
+				"nvidia.com/mig-1g.5gb":                resource.MustParse("7"),
+				"nvidia.com/mig-3g.20gb":               resource.MustParse("2"),
+				"nvidia.com/gpu.shared":                resource.MustParse("16"),
+				"amd.com/gpu":                          resource.MustParse("4"),
+				"gpu.intel.com/i915":                   resource.MustParse("1"),
+				"hugepages-2Mi":                        resource.MustParse("0"),
+				corev1.ResourceName("nvidia.com/mig-"): resource.MustParse("1"),
+			},
+		},
+	}
+
+	n := ConvertNode(node)
+
+	want := map[string]int{
+		"nvidia.com/gpu": 2, "nvidia.com/mig-1g.5gb": 7, "nvidia.com/mig-3g.20gb": 2, "nvidia.com/gpu.shared": 16, "amd.com/gpu": 4,
+	}
+	if !reflect.DeepEqual(n.GPUResources, want) {
+		t.Errorf("gpu_resources = %v, want %v", n.GPUResources, want)
+	}
+	if n.CapacityGPU != 2 {
+		t.Errorf("capacity_gpu = %d, want the nvidia.com/gpu count, 2", n.CapacityGPU)
+	}
+	if cpuOnly := ConvertNode(&corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "cpu-1"}}); cpuOnly.GPUResources != nil {
+		t.Errorf("a node without GPUs sends gpu_resources %v", cpuOnly.GPUResources)
+	}
+}
+
+func TestConvertNode_ForwardsGPULabelsPastTheLabelCap(t *testing.T) {
+	labels := make(map[string]string, 200)
+	for i := range 195 {
+		// Node Feature Discovery writes dozens of these, and they sort before nvidia.com/.
+		labels[fmt.Sprintf("feature.node.kubernetes.io/cpu-%03d", i)] = "true"
+	}
+	gpuLabels := map[string]string{
+		v1.LabelMIGStrategy: "single",
+		v1.LabelGPUProduct:  "NVIDIA-A100-SXM4-40GB-MIG-1g.5gb",
+		v1.LabelGPUCount:    "7",
+		v1.LabelGPUReplicas: "1",
+		v1.LabelGPUSlicesGI: "1",
+	}
+	maps.Copy(labels, gpuLabels)
+	node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "gpu-1", Labels: labels}}
+
+	n := ConvertNode(node)
+
+	if len(n.Labels) != v1.MaxMapEntries {
+		t.Fatalf("labels = %d entries, want the cap %d", len(n.Labels), v1.MaxMapEntries)
+	}
+	if _, ok := n.Labels[v1.LabelGPUProduct]; ok {
+		t.Fatalf("the test needs the GPU labels to sort past the label cap")
+	}
+	if !reflect.DeepEqual(n.GPULabels, gpuLabels) {
+		t.Errorf("gpu_labels = %v, want %v", n.GPULabels, gpuLabels)
+	}
+	if plain := ConvertNode(&corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "n", Labels: map[string]string{"team": "core"}}}); plain.GPULabels != nil {
+		t.Errorf("a node without GPU labels sends gpu_labels %v", plain.GPULabels)
+	}
+}
+
+func TestContainerSpec_RequestsEachGPUResourceFamily(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		resources    corev1.ResourceRequirements
+		wantRequest  int
+		wantRequests map[string]int
+	}{
+		{
+			name: "each family, a request before its limit",
+			resources: corev1.ResourceRequirements{
+				Requests: corev1.ResourceList{"nvidia.com/gpu": resource.MustParse("1"), "nvidia.com/mig-1g.5gb": resource.MustParse("2")},
+				Limits: corev1.ResourceList{
+					"nvidia.com/gpu": resource.MustParse("3"), "nvidia.com/mig-1g.5gb": resource.MustParse("2"),
+					"nvidia.com/gpu.shared": resource.MustParse("1"), "amd.com/gpu": resource.MustParse("2"),
+				},
+			},
+			wantRequest:  1,
+			wantRequests: map[string]int{"nvidia.com/gpu": 1, "nvidia.com/mig-1g.5gb": 2, "nvidia.com/gpu.shared": 1, "amd.com/gpu": 2},
+		},
+		{
+			name:         "a limit alone",
+			resources:    corev1.ResourceRequirements{Limits: corev1.ResourceList{"nvidia.com/mig-3g.40gb": resource.MustParse("1")}},
+			wantRequests: map[string]int{"nvidia.com/mig-3g.40gb": 1},
+		},
+		{
+			name: "no GPU",
+			resources: corev1.ResourceRequirements{
+				Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("500m"), "gpu.intel.com/i915": resource.MustParse("1")},
+				Limits:   corev1.ResourceList{"nvidia.com/gpu": resource.MustParse("0")},
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			spec := containerSpec(&corev1.Container{Name: "trainer", Resources: tc.resources})
+			if spec.GPURequest != tc.wantRequest {
+				t.Errorf("gpu_request = %d, want %d", spec.GPURequest, tc.wantRequest)
+			}
+			if !reflect.DeepEqual(spec.GPURequests, tc.wantRequests) {
+				t.Errorf("gpu_requests = %#v, want %#v", spec.GPURequests, tc.wantRequests)
+			}
+		})
+	}
+}
+
+func TestConvertNode_GPUMapsWithinTheAPIsCaps(t *testing.T) {
+	capacity := corev1.ResourceList{}
+	for i := range v1.MaxGPUMapEntries + 4 {
+		capacity[corev1.ResourceName(fmt.Sprintf("nvidia.com/mig-%dg.%dgb", i+1, 5*(i+1)))] = resource.MustParse("1")
+	}
+	// Both sort first, so only the guards keep them out.
+	capacity["amd.com/gpu"] = *resource.NewQuantity(v1.MaxGPUUnits+1, resource.DecimalSI)
+	long := corev1.ResourceName("nvidia.com/mig-0" + strings.Repeat("0", v1.MaxGPUResourceNameLength))
+	capacity[long] = resource.MustParse("1")
+
+	n := ConvertNode(&corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "gpu-1"}, Status: corev1.NodeStatus{Capacity: capacity}})
+
+	var names []string
+	for name := range capacity {
+		if s := string(name); s != string(long) && s != "amd.com/gpu" {
+			names = append(names, s)
+		}
+	}
+	slices.Sort(names)
+	want := map[string]int{}
+	for _, name := range names[:v1.MaxGPUMapEntries] {
+		want[name] = 1
+	}
+	if !reflect.DeepEqual(n.GPUResources, want) {
+		t.Errorf("gpu_resources = %v, want the first %d fitting names in order: %v", n.GPUResources, v1.MaxGPUMapEntries, want)
 	}
 }

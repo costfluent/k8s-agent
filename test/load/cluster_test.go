@@ -23,6 +23,7 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
+	storagev1 "k8s.io/api/storage/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -259,8 +260,61 @@ func pod(i int, s podShape) *corev1.Pod {
 			State:       corev1.ContainerState{Running: &corev1.ContainerStateRunning{StartedAt: created}},
 		})
 	}
+	if s.ownerKind == "StatefulSet" {
+		p.Spec.Volumes = append(p.Spec.Volumes, corev1.Volume{Name: "data", VolumeSource: corev1.VolumeSource{
+			PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: "data-" + s.name}}})
+	}
 	return p
 }
+
+// storageClasses are an EKS cluster's: the EBS CSI default and a rated local-path class.
+func storageClasses() *storagev1.StorageClassList {
+	deleteReclaim, bind := corev1.PersistentVolumeReclaimDelete, storagev1.VolumeBindingWaitForFirstConsumer
+	yes := true
+	return &storagev1.StorageClassList{Items: []storagev1.StorageClass{
+		{ObjectMeta: metav1.ObjectMeta{Name: "gp3", UID: uid("sc", 0), Annotations: map[string]string{"storageclass.kubernetes.io/is-default-class": "true"}},
+			Provisioner: "ebs.csi.aws.com", Parameters: map[string]string{"type": "gp3", "encrypted": "true"},
+			ReclaimPolicy: &deleteReclaim, VolumeBindingMode: &bind, AllowVolumeExpansion: &yes},
+		{ObjectMeta: metav1.ObjectMeta{Name: "local-path", UID: uid("sc", 1), Annotations: map[string]string{v1.AnnotationStorageGBHourlyRate: "0.0001"}},
+			Provisioner: "rancher.io/local-path", ReclaimPolicy: &deleteReclaim, VolumeBindingMode: &bind},
+	}}
+}
+
+// persistentVolume is the EBS volume the CSI driver provisioned for StatefulSet pod i's data claim.
+func persistentVolume(i int) *corev1.PersistentVolume {
+	s := shape(daemonSetPods + i)
+	name := fmt.Sprintf("pvc-%s", uid("pvc", i))
+	zone := fmt.Sprintf("eu-central-1%c", 'a'+i%3)
+	return &corev1.PersistentVolume{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: name, UID: uid("pv", i), ResourceVersion: strconv.Itoa(200000 + i), CreationTimestamp: created,
+			Annotations: map[string]string{"pv.kubernetes.io/provisioned-by": "ebs.csi.aws.com", "volume.kubernetes.io/provisioner-deletion-secret-name": ""},
+			Finalizers:  []string{"external-provisioner.volume.kubernetes.io/finalizer", "kubernetes.io/pv-protection", "external-attacher/ebs-csi-aws-com"},
+			ManagedFields: []metav1.ManagedFieldsEntry{
+				{Manager: "csi-provisioner", Operation: metav1.ManagedFieldsOperationUpdate, APIVersion: "v1", Time: &created, FieldsType: "FieldsV1", FieldsV1: statusFields()},
+			},
+		},
+		Spec: corev1.PersistentVolumeSpec{
+			Capacity: corev1.ResourceList{corev1.ResourceStorage: resource.MustParse("20Gi")},
+			PersistentVolumeSource: corev1.PersistentVolumeSource{CSI: &corev1.CSIPersistentVolumeSource{
+				Driver: "ebs.csi.aws.com", VolumeHandle: fmt.Sprintf("vol-%017x", i), FSType: "ext4",
+				VolumeAttributes: map[string]string{"storage.kubernetes.io/csiProvisionerIdentity": "1727769600000-8081-ebs.csi.aws.com"},
+			}},
+			AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
+			ClaimRef: &corev1.ObjectReference{Kind: "PersistentVolumeClaim", Namespace: s.namespace, Name: "data-" + s.name,
+				UID: uid("pvc", i), APIVersion: "v1", ResourceVersion: strconv.Itoa(300000 + i)},
+			PersistentVolumeReclaimPolicy: corev1.PersistentVolumeReclaimDelete,
+			StorageClassName:              "gp3",
+			VolumeMode:                    ptr(corev1.PersistentVolumeFilesystem),
+			NodeAffinity: &corev1.VolumeNodeAffinity{Required: &corev1.NodeSelector{NodeSelectorTerms: []corev1.NodeSelectorTerm{{
+				MatchExpressions: []corev1.NodeSelectorRequirement{{Key: "topology.kubernetes.io/zone", Operator: corev1.NodeSelectorOpIn, Values: []string{zone}}},
+			}}}},
+		},
+		Status: corev1.PersistentVolumeStatus{Phase: corev1.VolumeBound},
+	}
+}
+
+func ptr[T any](v T) *T { return &v }
 
 func node(i, port int) *corev1.Node {
 	labels := map[string]string{
@@ -420,6 +474,19 @@ func (a *fakeAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 			return l
 		})
+	case r.URL.Path == "/api/v1/persistentvolumes":
+		a.list(w, r, c, "PersistentVolumeList", func() int { return statefulSetPods }, func(i int) runtime.Object { return persistentVolume(i) },
+			func(items []runtime.Object, meta metav1.ListMeta) runtime.Object {
+				l := &corev1.PersistentVolumeList{ListMeta: meta}
+				for _, o := range items {
+					l.Items = append(l.Items, *o.(*corev1.PersistentVolume))
+				}
+				return l
+			})
+	case r.URL.Path == "/apis/storage.k8s.io/v1/storageclasses":
+		l := storageClasses()
+		l.ResourceVersion = a.resourceVersion()
+		a.write(w, c, l, storagev1.SchemeGroupVersion)
 	case r.URL.Path == "/api/v1/namespaces":
 		l := &corev1.NamespaceList{ListMeta: metav1.ListMeta{ResourceVersion: a.resourceVersion()}}
 		for i := range namespaceCount {

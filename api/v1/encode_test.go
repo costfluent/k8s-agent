@@ -26,6 +26,8 @@ func TestWriteJSON_MatchesTheEncoderAndStreams(t *testing.T) {
 		{"at the caps", atLimitsReport()},
 		{"no nodes or pods", Report{SchemaVersion: SchemaVersion, ClusterID: "c"}},
 		{"empty nodes and pods", Report{SchemaVersion: SchemaVersion, ClusterID: "c", Nodes: []Node{}, Pods: []Pod{}}},
+		{"empty volumes", Report{SchemaVersion: SchemaVersion, ClusterID: "c", Nodes: []Node{}, Pods: []Pod{}, Volumes: []Volume{}}},
+		{"volumes alone", Report{SchemaVersion: SchemaVersion, ClusterID: "c", Volumes: goldenReport().Volumes}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var want bytes.Buffer

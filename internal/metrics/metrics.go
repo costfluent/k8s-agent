@@ -49,6 +49,16 @@ var (
 		Help: "Label and annotation entries left out of a report to fit the API's caps, counted each time a map is read, by map.",
 	}, []string{"map"})
 
+	VolumesDropped = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "costfluent_agent_volumes_dropped_total",
+		Help: "Persistent volumes left out of a closed window past the API's volume cap; the first by name are sent.",
+	})
+
+	StorageUnreadable = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "costfluent_agent_storage_unreadable",
+		Help: "1 while the last list of persistent volumes or storage classes failed, so reports carry no volumes.",
+	})
+
 	OverSupportedSize = promauto.NewGauge(prometheus.GaugeOpts{
 		Name: "costfluent_agent_over_supported_size",
 		Help: "1 when the last closed window had more nodes, pods or containers per pod than the API accepts, so it was not sent.",

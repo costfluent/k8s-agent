@@ -1,20 +1,32 @@
 //go:build e2e
 
 // Package e2e installs the chart into a kind cluster, points the agent at a stub receiver, and
-// asserts that a real report arrives. Run it with `make e2e`; it needs docker, kind, kubectl and
-// helm on the PATH.
+// asserts that a real report arrives. The agent reports over TLS and trusts the receiver only
+// through the CA bundle its own image ships, extended with the test's CA, so an image that cannot
+// verify the API's certificate fails the run. Run it with `make e2e`; it needs docker, kind,
+// kubectl and helm on the PATH.
 package e2e
 
 import (
 	"bytes"
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/base64"
 	"encoding/json"
+	"encoding/pem"
 	"fmt"
+	"math/big"
 	"os"
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"regexp"
 	"runtime"
+	"slices"
 	"strings"
 	"syscall"
 	"testing"
@@ -30,13 +42,40 @@ const (
 	agentImage    = "costfluent-e2e/k8s-agent"
 	receiverImage = "costfluent-e2e/receiver"
 	imageTag      = "e2e"
+	apiEndpoint   = "https://receiver.e2e:8443"
 	fillerPods    = 50
 	reportWithin  = 3 * time.Minute
 )
 
+// agentVersion is the VERSION the agent image is built with, which every report must carry as
+// agent_version. Go's linker ignores an -X whose target is gone, so a renamed main.Version or a
+// dropped ARG or flag still builds, and only this check stops a release that reports "dev" or no
+// version.
+const agentVersion = "e2e"
+
 // kindest/node for kind v0.33.0. KIND_NODE_IMAGE overrides it, for example with a registry mirror
 // or another Kubernetes version; the default pulls upstream.
 const defaultNodeImage = "kindest/node:v1.37.0@sha256:a1ed56cfb0e7b93589bdf97c8cd566405a265939e3620fc4f5de89adff580ae5"
+
+// bundlePath is the first file Go reads its system roots from on Linux, and the only trust store
+// the agent's scratch image has.
+const bundlePath = "/etc/ssl/certs/ca-certificates.crt"
+
+// minBundleCertificates is far below the roughly 140 roots of the Mozilla bundle, so a routine
+// update never trips it, while an emptied or truncated bundle does.
+const minBundleCertificates = 100
+
+// notInImageTag matches the characters a Docker tag may not hold. A tag is at most 128 characters
+// and may not start with '.' or '-'.
+var notInImageTag = regexp.MustCompile(`[^A-Za-z0-9_.-]`)
+
+// tlsImageTag is the tag of the agent image that trusts this run's CA. Every run commits a
+// different CA, so the tag is per cluster, like the cluster: under one shared tag, concurrent runs
+// on one Docker daemon would load each other's image or remove each other's tag.
+func tlsImageTag(cluster string) string {
+	tag := "e2e-tls-" + notInImageTag.ReplaceAllString(cluster, "-")
+	return tag[:min(len(tag), 128)]
+}
 
 func env(key, fallback string) string {
 	if v := os.Getenv(key); v != "" {
@@ -118,6 +157,7 @@ func TestKindSmoke(t *testing.T) {
 	})
 	h.run("kind", "create", "cluster", "--name", cluster, "--image", env("KIND_NODE_IMAGE", defaultNodeImage),
 		"--kubeconfig", h.kubeconfig, "--wait", "180s")
+	h.assertVolumeClaimGuard(chart)
 
 	receiverDir := filepath.Join(dir, "receiver")
 	build := exec.CommandContext(ctx, "go", "build", "-trimpath", "-o", filepath.Join(receiverDir, "receiver"), "./test/e2e/receiver")
@@ -134,22 +174,25 @@ func TestKindSmoke(t *testing.T) {
 		t.Fatal(err)
 	}
 	h.run("docker", "build", "-q", "-t", receiverImage+":"+imageTag, receiverDir)
-	h.run("docker", "build", "-q", "-t", agentImage+":"+imageTag, "--build-arg", "VERSION=e2e", moduleRoot)
-	h.run("kind", "load", "docker-image", "--name", cluster, receiverImage+":"+imageTag, agentImage+":"+imageTag)
+	h.run("docker", "build", "-q", "-t", agentImage+":"+imageTag, "--build-arg", "VERSION="+agentVersion, moduleRoot)
+	caPEM, certPEM, keyPEM := testCertificates(t)
+	tlsTag := tlsImageTag(cluster)
+	h.trustInImage(caPEM, dir, tlsTag)
+	h.run("kind", "load", "docker-image", "--name", cluster, receiverImage+":"+imageTag, agentImage+":"+tlsTag)
 
-	h.apply(workloads())
+	h.apply(workloads(certPEM, keyPEM))
 	h.run("kubectl", "-n", "e2e", "rollout", "status", "deployment/receiver", "--timeout=120s")
 	h.run("kubectl", "-n", "e2e-filler", "rollout", "status", "deployment/filler", "--timeout=180s")
 
 	installed := time.Now()
 	h.run("helm", "install", release, chart, "--namespace", "costfluent", "--create-namespace",
 		"--set", "agent.token="+token,
-		"--set", "agent.apiEndpoint=http://receiver.e2e:8080",
+		"--set", "agent.apiEndpoint="+apiEndpoint,
 		"--set", "agent.pollingInterval=5",
 		// kind kubelets serve self-signed certificates.
 		"--set", "agent.disableKubeTLSverify=true",
 		"--set", "image.repository="+agentImage,
-		"--set", "image.tag="+imageTag,
+		"--set", "image.tag="+tlsTag,
 		"--set", "image.pullPolicy=Never")
 	t.Cleanup(func() {
 		if t.Failed() {
@@ -161,10 +204,173 @@ func TestKindSmoke(t *testing.T) {
 	})
 
 	report := h.awaitReport(installed)
-	t.Logf("report after %s: window %s to %s, %d nodes, %d pods",
+	t.Logf("report from %s after %s: window %s to %s, %d nodes, %d pods", apiEndpoint,
 		time.Since(installed).Round(time.Second), report.WindowStart.Format(time.RFC3339), report.WindowEnd.Format(time.RFC3339),
 		len(report.Nodes), len(report.Pods))
 	logAgentFootprint(t, report)
+}
+
+// testCertificates returns a CA and a server certificate it signs for the receiver's Service names,
+// as PEM. The hour of slack before now covers a node clock slightly behind the host's.
+func testCertificates(t *testing.T) (caPEM, certPEM, keyPEM []byte) {
+	t.Helper()
+	now := time.Now()
+	caKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ca := &x509.Certificate{
+		SerialNumber:          big.NewInt(1),
+		Subject:               pkix.Name{CommonName: "costfluent e2e CA"},
+		NotBefore:             now.Add(-time.Hour),
+		NotAfter:              now.Add(24 * time.Hour),
+		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageCRLSign,
+		BasicConstraintsValid: true,
+		IsCA:                  true,
+	}
+	caDER, err := x509.CreateCertificate(rand.Reader, ca, ca, &caKey.PublicKey, caKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ca, err = x509.ParseCertificate(caDER)
+	if err != nil {
+		t.Fatal(err)
+	}
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := &x509.Certificate{
+		SerialNumber: big.NewInt(2),
+		Subject:      pkix.Name{CommonName: "receiver.e2e"},
+		DNSNames:     []string{"receiver.e2e", "receiver.e2e.svc", "receiver.e2e.svc.cluster.local"},
+		NotBefore:    now.Add(-time.Hour),
+		NotAfter:     now.Add(24 * time.Hour),
+		KeyUsage:     x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+	}
+	serverDER, err := x509.CreateCertificate(rand.Reader, server, ca, &key.PublicKey, caKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	keyDER, err := x509.MarshalPKCS8PrivateKey(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: caDER}),
+		pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: serverDER}),
+		pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: keyDER})
+}
+
+// trustInImage checks the CA bundle the agent image ships and commits a copy of the image, tagged
+// tag, whose bundle also holds caPEM. The CA is appended to the shipped file rather than
+// added beside it or pointed at with SSL_CERT_FILE, so the agent still trusts only what the image
+// carries, and a bundle that is missing, moved or empty fails here.
+func (h *harness) trustInImage(caPEM []byte, dir, tag string) {
+	h.t.Helper()
+	container := strings.TrimSpace(h.run("docker", "create", agentImage+":"+imageTag))
+	h.t.Cleanup(func() {
+		// -v also removes the anonymous volume the image's VOLUME gives the container.
+		if out, err := exec.Command("docker", "rm", "-v", container).CombinedOutput(); err != nil {
+			h.t.Logf("docker rm: %v\n%s", err, out)
+		}
+	})
+	file := filepath.Join(dir, "ca-certificates.crt")
+	if out, err := h.try("docker", "cp", container+":"+bundlePath, file); err != nil {
+		h.t.Fatalf("the agent image ships no CA bundle at %s: %v\n%s", bundlePath, err, out)
+	}
+	bundle, err := os.ReadFile(file)
+	if err != nil {
+		h.t.Fatal(err)
+	}
+	if n := countCertificates(bundle); n < minBundleCertificates {
+		h.t.Fatalf("the agent image's CA bundle holds %d certificates, fewer than %d", n, minBundleCertificates)
+	}
+	if len(bundle) > 0 && !bytes.HasSuffix(bundle, []byte("\n")) {
+		bundle = append(bundle, '\n')
+	}
+	bundle = append(bundle, caPEM...)
+	if err := os.WriteFile(file, bundle, 0o644); err != nil {
+		h.t.Fatal(err)
+	}
+	// docker cp keeps the file's mode, and the image runs as user 1000, so the file must be
+	// world-readable. It already exists from the copy out, which set its mode, and WriteFile's
+	// mode applies only to a file it creates, so this is the one line that sets it.
+	if err := os.Chmod(file, 0o644); err != nil {
+		h.t.Fatal(err)
+	}
+	h.run("docker", "cp", file, container+":"+bundlePath)
+	h.run("docker", "commit", container, agentImage+":"+tag)
+	h.t.Cleanup(func() {
+		if out, err := exec.Command("docker", "rmi", agentImage+":"+tag).CombinedOutput(); err != nil {
+			h.t.Logf("docker rmi: %v\n%s", err, out)
+		}
+	})
+}
+
+// countCertificates counts the PEM certificates in bundle that Go can parse, the ones it would
+// trust.
+func countCertificates(bundle []byte) int {
+	var n int
+	for {
+		var block *pem.Block
+		block, bundle = pem.Decode(bundle)
+		if block == nil {
+			return n
+		}
+		if block.Type != "CERTIFICATE" {
+			continue
+		}
+		if _, err := x509.ParseCertificate(block.Bytes); err == nil {
+			n++
+		}
+	}
+}
+
+// defaultClassAnnotation marks the StorageClass a claim naming none is given; kind's "standard"
+// class carries it.
+const defaultClassAnnotation = "storageclass.kubernetes.io/is-default-class"
+
+// assertVolumeClaimGuard holds the chart to refusing an install whose volume claim no StorageClass
+// in the cluster can provision. Such a claim stays Pending, so the pod is never scheduled and the
+// agent never starts to log why. Only a render against a cluster sees its StorageClasses, so this
+// runs here and not in check-helm-chart.sh, whose offline renders the guard must let through.
+func (h *harness) assertVolumeClaimGuard(chart string) {
+	h.t.Helper()
+	render := func(args ...string) (string, error) {
+		return h.try("helm", append([]string{"template", release, chart, "--namespace", "costfluent",
+			"--dry-run=server", "--set", "agent.token=" + token}, args...)...)
+	}
+	refused := func(want string, args ...string) {
+		h.t.Helper()
+		out, err := render(args...)
+		if err == nil {
+			h.t.Fatalf("helm template %v rendered, but must refuse the install with %q", args, want)
+		}
+		if !strings.Contains(out, want) {
+			h.t.Fatalf("helm template %v failed without %q:\n%s", args, want, out)
+		}
+	}
+	accepted := func(args ...string) {
+		h.t.Helper()
+		if out, err := render(args...); err != nil {
+			h.t.Fatalf("helm template %v must render: %v\n%s", args, err, out)
+		}
+	}
+
+	h.run("kubectl", "annotate", "storageclass", "standard", defaultClassAnnotation+"-")
+	refused("no default StorageClass")
+	refused(`StorageClass "missing"`, "--set", "persist.storageClassName=missing")
+	accepted("--set", "persist.storageClassName=standard")
+	accepted("--set", "persist=null")
+	// The claim of an installed release is fixed and may already be bound, so an upgrade is not held
+	// to the classes the cluster has now.
+	accepted("--is-upgrade")
+
+	h.run("kubectl", "annotate", "storageclass", "standard", defaultClassAnnotation+"=true")
+	accepted()
+	accepted("--set", "persist.storageClassName=standard")
+	refused(`StorageClass "missing"`, "--set", "persist.storageClassName=missing")
 }
 
 // awaitReport polls the receiver until a report meets criterion 3 or the deadline passes.
@@ -210,8 +416,9 @@ func check(body json.RawMessage) (v1.Report, string) {
 	if err := dec.Decode(&r); err != nil {
 		return r, fmt.Sprintf("report does not decode into api/v1: %v", err)
 	}
-	if r.SchemaVersion != v1.SchemaVersion || r.ClusterID != clusterID || r.AgentInstanceID == "" {
-		return r, fmt.Sprintf("header: schema %d, cluster %q, instance %q", r.SchemaVersion, r.ClusterID, r.AgentInstanceID)
+	if r.SchemaVersion != v1.SchemaVersion || r.ClusterID != clusterID || r.AgentInstanceID == "" || r.AgentVersion != agentVersion {
+		return r, fmt.Sprintf("header: schema %d, cluster %q, instance %q, agent version %q (built with %q)",
+			r.SchemaVersion, r.ClusterID, r.AgentInstanceID, r.AgentVersion, agentVersion)
 	}
 	if len(r.Nodes) == 0 {
 		return r, "no nodes"
@@ -232,7 +439,31 @@ func check(body json.RawMessage) (v1.Report, string) {
 	if cpu <= 0 {
 		return r, "CPU usage is zero"
 	}
-	return r, ""
+	return r, checkAgentClaim(r)
+}
+
+// checkAgentClaim holds the report to the agent's own buffer volume: a Bound volume of kind's
+// standard class serving the StatefulSet's data claim, which the agent's pod mounts.
+func checkAgentClaim(r v1.Report) string {
+	claim := "data-" + release + "-costfluent-k8s-agent-0"
+	var volume *v1.Volume
+	for i := range r.Volumes {
+		if r.Volumes[i].ClaimNamespace == "costfluent" && r.Volumes[i].ClaimName == claim {
+			volume = &r.Volumes[i]
+		}
+	}
+	if volume == nil {
+		return fmt.Sprintf("no volume serves the agent's claim %s among %d volumes", claim, len(r.Volumes))
+	}
+	if volume.Phase != "Bound" || volume.StorageClass != "standard" || volume.CapacityBytes <= 0 || volume.ObservedSeconds <= 0 {
+		return fmt.Sprintf("the agent's volume = %+v, want Bound, of class standard, sized and observed", *volume)
+	}
+	for _, p := range r.Pods {
+		if p.Namespace == "costfluent" && slices.Contains(p.Claims, claim) {
+			return ""
+		}
+	}
+	return "the agent's pod does not report mounting its claim " + claim
 }
 
 // logAgentFootprint prints the agent's own memory as the report measured it, which is what the
@@ -255,7 +486,7 @@ func logAgentFootprint(t *testing.T, r v1.Report) {
 	}
 }
 
-func workloads() string {
+func workloads(certPEM, keyPEM []byte) string {
 	return fmt.Sprintf(`apiVersion: v1
 kind: Namespace
 metadata:
@@ -265,6 +496,16 @@ apiVersion: v1
 kind: Namespace
 metadata:
   name: e2e-filler
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: receiver-tls
+  namespace: e2e
+type: kubernetes.io/tls
+data:
+  tls.crt: %[4]s
+  tls.key: %[5]s
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -284,10 +525,19 @@ spec:
           imagePullPolicy: Never
           env:
             - {name: RECEIVER_TOKEN, value: %[2]q}
+            - {name: RECEIVER_TLS_CERT, value: /tls/tls.crt}
+            - {name: RECEIVER_TLS_KEY, value: /tls/tls.key}
           ports:
-            - containerPort: 8080
+            - {name: http, containerPort: 8080}
+            - {name: https, containerPort: 8443}
+          # Over TLS, so the rollout waits for the listener the agent reports to.
           readinessProbe:
-            httpGet: {path: /healthz, port: 8080}
+            httpGet: {path: /healthz, port: 8443, scheme: HTTPS}
+          volumeMounts:
+            - {name: tls, mountPath: /tls, readOnly: true}
+      volumes:
+        - name: tls
+          secret: {secretName: receiver-tls}
 ---
 apiVersion: v1
 kind: Service
@@ -297,8 +547,8 @@ metadata:
 spec:
   selector: {app: receiver}
   ports:
-    - port: 8080
-      targetPort: 8080
+    - {name: http, port: 8080, targetPort: 8080}
+    - {name: https, port: 8443, targetPort: 8443}
 ---
 # Brings the cluster to about 60 pods, the size the chart README's sizing is measured at.
 apiVersion: apps/v1
@@ -322,5 +572,6 @@ spec:
             - {name: RECEIVER_TOKEN, value: unused}
           resources:
             requests: {cpu: 1m, memory: 8Mi}
-`, receiverImage+":"+imageTag, token, fillerPods)
+`, receiverImage+":"+imageTag, token, fillerPods,
+		base64.StdEncoding.EncodeToString(certPEM), base64.StdEncoding.EncodeToString(keyPEM))
 }

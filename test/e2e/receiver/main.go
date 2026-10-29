@@ -3,6 +3,12 @@
 // POST /v1/kubernetes/reports only when the body is gzip and the bearer token matches
 // RECEIVER_TOKEN, keeps each accepted body, and serves them back as a JSON array on GET /reports.
 // Anything else it refuses and counts, so the test can tell a wrong request from no request.
+//
+// It always serves plain http on :8080. When RECEIVER_TLS_CERT and RECEIVER_TLS_KEY name a PEM
+// certificate and key, it also serves the same routes over TLS on :8443, and then refuses
+// GET /v1/me and POST /v1/kubernetes/reports that arrive over plain http, so an agent that reports
+// without TLS fails the run instead of passing it; /healthz and /reports stay on both. Setting only
+// one of the two is a fatal error.
 package main
 
 import (
@@ -38,9 +44,27 @@ func main() {
 	if token == "" {
 		log.Fatal("RECEIVER_TOKEN is required")
 	}
+	certFile, keyFile := os.Getenv("RECEIVER_TLS_CERT"), os.Getenv("RECEIVER_TLS_KEY")
+	switch {
+	case certFile != "" && keyFile == "":
+		log.Fatal("RECEIVER_TLS_KEY is required when RECEIVER_TLS_CERT is set")
+	case keyFile != "" && certFile == "":
+		log.Fatal("RECEIVER_TLS_CERT is required when RECEIVER_TLS_KEY is set")
+	}
+	withTLS := certFile != ""
 	s := &store{}
+	plainWhileTLS := func(w http.ResponseWriter, r *http.Request, route string) bool {
+		if withTLS && r.TLS == nil {
+			s.refuse(w, http.StatusBadRequest, "plain http on "+route+" while TLS is configured")
+			return true
+		}
+		return false
+	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /v1/me", func(w http.ResponseWriter, r *http.Request) {
+		if plainWhileTLS(w, r, "/v1/me") {
+			return
+		}
 		if r.Header.Get("Authorization") != "Bearer "+token {
 			s.refuse(w, http.StatusUnauthorized, "missing or wrong bearer token on /v1/me")
 			return
@@ -49,6 +73,9 @@ func main() {
 		_, _ = io.WriteString(w, `{"organizationId":"org_e2e","tokenType":"cluster","tokenName":"kind-e2e","capabilities":["reportKubernetesUsage"],"clusterId":"kind-e2e"}`)
 	})
 	mux.HandleFunc("POST /v1/kubernetes/reports", func(w http.ResponseWriter, r *http.Request) {
+		if plainWhileTLS(w, r, "/v1/kubernetes/reports") {
+			return
+		}
 		if r.Header.Get("Authorization") != "Bearer "+token {
 			s.refuse(w, http.StatusUnauthorized, "missing or wrong bearer token")
 			return
@@ -94,5 +121,12 @@ func main() {
 	})
 
 	srv := &http.Server{Addr: ":8080", Handler: mux, ReadHeaderTimeout: 10 * time.Second}
-	log.Fatal(srv.ListenAndServe())
+	if !withTLS {
+		log.Fatal(srv.ListenAndServe())
+	}
+	tlsSrv := &http.Server{Addr: ":8443", Handler: mux, ReadHeaderTimeout: 10 * time.Second}
+	errs := make(chan error, 2)
+	go func() { errs <- srv.ListenAndServe() }()
+	go func() { errs <- tlsSrv.ListenAndServeTLS(certFile, keyFile) }()
+	log.Fatal(<-errs)
 }

@@ -46,6 +46,7 @@ func goldenReport() Report {
 				CapacityCPUCores:       8,
 				CapacityMemoryBytes:    34359738368,
 				CapacityGPU:            1,
+				GPUResources:           map[string]int{ResourceNVIDIAGPU: 1},
 				AllocatableCPUCores:    7.9,
 				AllocatableMemoryBytes: 33285996544,
 				Annotations: map[string]string{
@@ -87,6 +88,7 @@ func goldenReport() Report {
 				Labels:          map[string]string{"app": "trainer", "team": "research"},
 				Annotations:     map[string]string{"owner": "research@example.com"},
 				NamespaceLabels: map[string]string{"cost-center": "rnd"},
+				Claims:          []string{"data-trainer-0"},
 				Containers: []Container{
 					{
 						Name:                       "trainer",
@@ -94,6 +96,7 @@ func goldenReport() Report {
 						CPURequestCores:            2,
 						MemoryRequestBytes:         4294967296,
 						GPURequest:                 1,
+						GPURequests:                map[string]int{ResourceNVIDIAGPU: 1},
 						CPUUsageCoreSeconds:        4500,
 						MemoryUsageByteSeconds:     5153960755200,
 						CPUAllocatedCoreSeconds:    4500,
@@ -114,6 +117,29 @@ func goldenReport() Report {
 						MemoryUsagePeakBytes:       20971520,
 					},
 				},
+			},
+		},
+		Volumes: []Volume{
+			{
+				Name:            "pvc-cf675ad5-0d5a-4a4c-9a39-3a3b8f6c1d2e",
+				CapacityBytes:   107374182400,
+				StorageClass:    "managed-csi",
+				CSIDriver:       "disk.csi.azure.com",
+				VolumeHandle:    "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/mc_rg_aks_westeurope/providers/Microsoft.Compute/disks/pvc-cf675ad5-0d5a-4a4c-9a39-3a3b8f6c1d2e",
+				Phase:           "Bound",
+				ClaimNamespace:  "ml",
+				ClaimName:       "data-trainer-0",
+				ObservedSeconds: 3600,
+				ClaimLabels:     map[string]string{"app": "trainer"},
+			},
+			{
+				Name:                    "pvc-0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d",
+				CapacityBytes:           10737418240,
+				StorageClass:            "local-path",
+				CSIDriver:               "rancher.io/local-path",
+				Phase:                   "Released",
+				ObservedSeconds:         3600,
+				StorageClassAnnotations: map[string]string{AnnotationStorageGBHourlyRate: "0.0001"},
 			},
 		},
 	}
@@ -152,7 +178,25 @@ func TestReport_GoldenFileRoundTrips(t *testing.T) {
 	if err := dec.Decode(&r); err != nil {
 		t.Fatal(err)
 	}
-	if r.SchemaVersion != SchemaVersion || len(r.Nodes) != 2 || len(r.Pods) != 2 {
+	if r.SchemaVersion != SchemaVersion || len(r.Nodes) != 2 || len(r.Pods) != 2 || len(r.Volumes) != 2 {
 		t.Fatalf("unexpected golden report: %+v", r)
+	}
+}
+
+func TestIsGPUResource_MatchesTheFourFamiliesOnly(t *testing.T) {
+	for name, want := range map[string]bool{
+		"nvidia.com/gpu":         true,
+		"nvidia.com/gpu.shared":  true,
+		"amd.com/gpu":            true,
+		"nvidia.com/mig-1g.5gb":  true,
+		"nvidia.com/mig-3g.40gb": true,
+		"nvidia.com/mig-":        false,
+		"nvidia.com/gpu.memory":  false,
+		"gpu.intel.com/i915":     false,
+		"cpu":                    false,
+	} {
+		if got := IsGPUResource(name); got != want {
+			t.Errorf("IsGPUResource(%q) = %v, want %v", name, got, want)
+		}
 	}
 }

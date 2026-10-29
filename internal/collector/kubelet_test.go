@@ -2,6 +2,8 @@ package collector
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"maps"
@@ -19,6 +21,8 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
+	"go.uber.org/zap/zaptest/observer"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -324,6 +328,62 @@ func TestKubeletCollector_ReportsAFailedNodeAndRatesItAcrossTheGapOnRecovery(t *
 	}
 	if u := usage[web]; !u.HasCPU || math.Abs(u.CPUCores-0.15) > 1e-9 {
 		t.Errorf("recovered rate = %+v, want 3 core-seconds over the 20 s since the last sample", u)
+	}
+}
+
+func TestKubeletCollector_NamesTheSkipVerifySettingOnlyForACertificateThatDoesNotVerify(t *testing.T) {
+	const hint = "agent.disableKubeTLSverify=true"
+	at := time.Date(2026, 10, 27, 10, 0, 0, 0, time.UTC)
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(appMetrics("web-0", 1, at)))
+	}))
+	defer srv.Close()
+	forbidden := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+	}))
+	defer forbidden.Close()
+	closed := httptest.NewTLSServer(http.NotFoundHandler())
+	closed.Close()
+
+	// An empty pool trusts no certificate, as the cluster CA trusts none a kubelet signed itself.
+	untrusting := &http.Client{Transport: &http.Transport{TLSClientConfig: &tls.Config{RootCAs: x509.NewCertPool()}}}
+	// The httptest certificate names 127.0.0.1 and example.com, not localhost.
+	otherName := kubeletNode(t, "kubelet", srv.URL)
+	otherName.Status.Addresses = []corev1.NodeAddress{{Type: corev1.NodeInternalIP, Address: "localhost"}}
+
+	cases := []struct {
+		name     string
+		client   *http.Client
+		node     *corev1.Node
+		wantHint bool
+		want     string
+	}{
+		{"self-signed", untrusting, kubeletNode(t, "kubelet", srv.URL), true, "x509"},
+		{"another host's certificate", srv.Client(), otherName, true, "x509"},
+		{"forbidden", forbidden.Client(), kubeletNode(t, "kubelet", forbidden.URL), false, "ClusterRole"},
+		{"unreachable", srv.Client(), kubeletNode(t, "kubelet", closed.URL), false, "connect"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			core, logs := observer.New(zapcore.WarnLevel)
+			kubelet := NewKubeletCollector(tc.client, config.DefaultNodeAddressTypes, 0, zap.New(core))
+
+			_, failed := kubelet.Scrape(context.Background(), []*corev1.Node{tc.node})
+			if !failed["kubelet"] {
+				t.Fatalf("failed nodes = %v, want the kubelet", failed)
+			}
+			entries := logs.FilterMessage("kubelet scrape failed").All()
+			if len(entries) != 1 {
+				t.Fatalf("logged %d scrape failures, want 1: %v", len(entries), logs.All())
+			}
+			logged, _ := entries[0].ContextMap()["error"].(string)
+			if !strings.Contains(logged, tc.want) {
+				t.Errorf("logged error %q, want it to keep the cause %q", logged, tc.want)
+			}
+			if got := strings.Contains(logged, hint); got != tc.wantHint {
+				t.Errorf("logged error %q names %s: %v, want %v", logged, hint, got, tc.wantHint)
+			}
+		})
 	}
 }
 

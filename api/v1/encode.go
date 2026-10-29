@@ -7,21 +7,22 @@ import (
 	"io"
 )
 
-// listsTail is how a Report without nodes and pods ends. Nodes and pods are its last fields, so
-// WriteJSON can write everything before them in one piece and the lists item by item.
+// listsTail is how a Report without nodes, pods and volumes ends. They are its last fields, volumes
+// omitted when empty, so WriteJSON can write everything before them in one piece and the lists item
+// by item.
 const listsTail = `"nodes":null,"pods":null}`
 
-// WriteJSON writes r as JSON followed by a newline, byte for byte as json.Encoder would, one node or
-// pod at a time, so a report at the caps is never held in memory encoded whole.
+// WriteJSON writes r as JSON followed by a newline, byte for byte as json.Encoder would, one node,
+// pod or volume at a time, so a report at the caps is never held in memory encoded whole.
 func WriteJSON(w io.Writer, r Report) error {
-	nodes, pods := r.Nodes, r.Pods
-	r.Nodes, r.Pods = nil, nil
+	nodes, pods, volumes := r.Nodes, r.Pods, r.Volumes
+	r.Nodes, r.Pods, r.Volumes = nil, nil, nil
 	head, err := json.Marshal(r)
 	if err != nil {
 		return err
 	}
 	if !bytes.HasSuffix(head, []byte(listsTail)) {
-		return errors.New("v1.Report no longer ends with its nodes and pods; WriteJSON must change with it")
+		return errors.New("v1.Report no longer ends with its nodes, pods and volumes; WriteJSON must change with it")
 	}
 	if _, err := w.Write(head[:len(head)-len(listsTail)]); err != nil {
 		return err
@@ -37,6 +38,14 @@ func WriteJSON(w io.Writer, r Report) error {
 	}
 	if err := writeArray(w, pods); err != nil {
 		return err
+	}
+	if len(volumes) > 0 {
+		if _, err := io.WriteString(w, `,"volumes":`); err != nil {
+			return err
+		}
+		if err := writeArray(w, volumes); err != nil {
+			return err
+		}
 	}
 	_, err = io.WriteString(w, "}\n")
 	return err
