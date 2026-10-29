@@ -207,3 +207,22 @@ func TestLoad_ReadsTheScrapeConcurrency(t *testing.T) {
 		}
 	}
 }
+
+// Claim labels are a tenant's to set, so the agent lists claims only when the owner opts in.
+func TestParse_CollectPVCLabels(t *testing.T) {
+	for raw, want := range map[string]bool{"": false, "false": false, "true": true, "1": true} {
+		t.Run(raw, func(t *testing.T) {
+			cfg, err := load(env(map[string]string{"COSTFLUENT_TOKEN": "t", "COSTFLUENT_COLLECT_PVC_LABELS": raw}))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if cfg.CollectPVCLabels != want {
+				t.Errorf("COSTFLUENT_COLLECT_PVC_LABELS=%q gives %v, want %v", raw, cfg.CollectPVCLabels, want)
+			}
+		})
+	}
+	if _, err := load(env(map[string]string{"COSTFLUENT_TOKEN": "t", "COSTFLUENT_COLLECT_PVC_LABELS": "yes please"})); err == nil ||
+		!strings.Contains(err.Error(), "COSTFLUENT_COLLECT_PVC_LABELS") {
+		t.Fatalf("err = %v, want one naming COSTFLUENT_COLLECT_PVC_LABELS", err)
+	}
+}

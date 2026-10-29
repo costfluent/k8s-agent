@@ -2,6 +2,8 @@ package collector
 
 import (
 	"context"
+	"crypto/tls"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -199,6 +201,10 @@ func (c *KubeletCollector) scrapeNode(ctx context.Context, node *corev1.Node) (m
 	}
 	req.Header.Set("Accept", "text/plain;version=0.0.4")
 	resp, err := c.client.Do(req)
+	var certErr *tls.CertificateVerificationError
+	if errors.As(err, &certErr) {
+		return nil, fmt.Errorf("GET %s: %w (a kubelet whose certificate the cluster CA does not verify, such as the self-signed ones on kind and Talos, needs agent.disableKubeTLSverify=true in the chart, or COSTFLUENT_KUBE_SKIP_TLS_VERIFY=true)", endpoint, err)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("GET %s: %w", endpoint, err)
 	}

@@ -97,13 +97,15 @@ func richNode(name string) *corev1.Node {
 			Name: name, UID: "node-uid", ResourceVersion: "7",
 			Labels: map[string]string{"node.kubernetes.io/instance-type": "m6i.large", "topology.kubernetes.io/region": "eu-central-1",
 				"topology.kubernetes.io/zone": "eu-central-1a", "karpenter.sh/capacity-type": "spot", "team": "core"},
-			Annotations:   map[string]string{v1.AnnotationVCPUHourlyRate: "0.02", v1.AnnotationGPUHourlyRate: "0.9", "csi.volume.kubernetes.io/nodeid": "{}"},
+			Annotations: map[string]string{v1.AnnotationVCPUHourlyRate: "0.02", v1.AnnotationGPUHourlyRate: "0.9", v1.AnnotationPhysicalGPUCount: "1",
+				"csi.volume.kubernetes.io/nodeid": "{}"},
 			ManagedFields: []metav1.ManagedFieldsEntry{{Manager: "kubelet"}},
 		},
 		Spec: corev1.NodeSpec{ProviderID: "aws:///eu-central-1a/i-1", PodCIDR: "10.0.0.0/24", Taints: []corev1.Taint{{Key: "dedicated", Effect: corev1.TaintEffectNoSchedule}}},
 		Status: corev1.NodeStatus{
 			Capacity: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("2"), corev1.ResourceMemory: resource.MustParse("8Gi"),
-				gpuResource: resource.MustParse("1"), corev1.ResourcePods: resource.MustParse("58")},
+				gpuResource: resource.MustParse("1"), "nvidia.com/mig-1g.5gb": resource.MustParse("7"), "nvidia.com/gpu.shared": resource.MustParse("4"),
+				"amd.com/gpu": resource.MustParse("2"), corev1.ResourcePods: resource.MustParse("58")},
 			Allocatable: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("1930m"), corev1.ResourceMemory: resource.MustParse("7Gi"),
 				corev1.ResourcePods: resource.MustParse("58")},
 			Addresses:       []corev1.NodeAddress{{Type: corev1.NodeInternalIP, Address: "10.1.1.1"}, {Type: corev1.NodeHostName, Address: name}},
@@ -126,8 +128,8 @@ func TestMetadata_CachedObjectsYieldWhatTheOriginalsDo(t *testing.T) {
 		t.Fatal(err)
 	}
 	specs := []ContainerSpec{
-		{Name: "app", CPURequestCores: 0.25, MemoryRequestBytes: 512 << 20, GPURequest: 1},
-		{Name: "sidecar", GPURequest: 2},
+		{Name: "app", CPURequestCores: 0.25, MemoryRequestBytes: 512 << 20, GPURequest: 1, GPURequests: map[string]int{"nvidia.com/gpu": 1}},
+		{Name: "sidecar", GPURequest: 2, GPURequests: map[string]int{"nvidia.com/gpu": 2}},
 	}
 	want := map[string]PodInfo{
 		"web-0": {Pod: v1.Pod{Namespace: "shop", Name: "web-0", Node: "n1", ControllerKind: "StatefulSet", Controller: "web",
@@ -171,7 +173,10 @@ func TestMetadata_CacheKeepsOnlyWhatTheAgentReads(t *testing.T) {
 	}
 	want := &cachedPod{Namespace: "shop", Name: "web-0", Node: "n1", Phase: "Running", OwnerKind: "StatefulSet", OwnerName: "web",
 		Labels: map[string]string{"app": "web", "team": "core"}, Annotations: map[string]string{"owner": "core@example.com"},
-		Containers: []ContainerSpec{{Name: "app", CPURequestCores: 0.25, MemoryRequestBytes: 512 << 20, GPURequest: 1}, {Name: "sidecar", GPURequest: 2}}}
+		Containers: []ContainerSpec{
+			{Name: "app", CPURequestCores: 0.25, MemoryRequestBytes: 512 << 20, GPURequest: 1, GPURequests: map[string]int{"nvidia.com/gpu": 1}},
+			{Name: "sidecar", GPURequest: 2, GPURequests: map[string]int{"nvidia.com/gpu": 2}},
+		}}
 	if !reflect.DeepEqual(pods[0], want) {
 		t.Errorf("cached pod = %+v, want only what the agent reads: %+v", pods[0], want)
 	}
@@ -184,8 +189,18 @@ func TestMetadata_CacheKeepsOnlyWhatTheAgentReads(t *testing.T) {
 	if n.ManagedFields != nil || n.Status.Images != nil || n.Status.Conditions != nil || n.Spec.Taints != nil || n.Status.NodeInfo.KubeletVersion != "" {
 		t.Errorf("the cached node keeps fields the agent never reads: %+v", n)
 	}
-	if _, ok := n.Annotations["csi.volume.kubernetes.io/nodeid"]; ok {
-		t.Errorf("node annotations = %v, want the rate annotations only", n.Annotations)
+	wantCapacity := []corev1.ResourceName{corev1.ResourceCPU, corev1.ResourceMemory, gpuResource, "nvidia.com/mig-1g.5gb", "nvidia.com/gpu.shared", "amd.com/gpu"}
+	if len(n.Status.Capacity) != len(wantCapacity) {
+		t.Errorf("node capacity = %v, want only %v", n.Status.Capacity, wantCapacity)
+	}
+	for _, r := range wantCapacity {
+		if _, ok := n.Status.Capacity[r]; !ok {
+			t.Errorf("node capacity = %v, missing %s", n.Status.Capacity, r)
+		}
+	}
+	wantAnnotations := map[string]string{v1.AnnotationVCPUHourlyRate: "0.02", v1.AnnotationGPUHourlyRate: "0.9", v1.AnnotationPhysicalGPUCount: "1"}
+	if !reflect.DeepEqual(n.Annotations, wantAnnotations) {
+		t.Errorf("node annotations = %v, want the forwarded annotations only: %v", n.Annotations, wantAnnotations)
 	}
 }
 

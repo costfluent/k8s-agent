@@ -63,9 +63,11 @@ type Config struct {
 	AllowedLabels          []string
 	AllowedAnnotations     []string
 	CollectNamespaceLabels bool
-	ReportHTTPProxy        *url.URL
-	DataDir                string
-	MetricsPort            int
+	// CollectPVCLabels sends each bound volume's claim labels, which takes listing every claim.
+	CollectPVCLabels bool
+	ReportHTTPProxy  *url.URL
+	DataDir          string
+	MetricsPort      int
 	// KubeAPIQPS and KubeAPIBurst bound the agent's requests to the Kubernetes API server.
 	KubeAPIQPS   int
 	KubeAPIBurst int
@@ -151,6 +153,9 @@ func load(lookup func(string) (string, bool)) (*Config, error) {
 		errs = append(errs, err)
 	}
 	if cfg.CollectNamespaceLabels, err = parseBool("COSTFLUENT_COLLECT_NAMESPACE_LABELS", get("COSTFLUENT_COLLECT_NAMESPACE_LABELS")); err != nil {
+		errs = append(errs, err)
+	}
+	if cfg.CollectPVCLabels, err = parseBool("COSTFLUENT_COLLECT_PVC_LABELS", get("COSTFLUENT_COLLECT_PVC_LABELS")); err != nil {
 		errs = append(errs, err)
 	}
 

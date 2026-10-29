@@ -26,6 +26,8 @@ func TestMetrics_AreRegisteredOnTheDefaultRegistry(t *testing.T) {
 		"costfluent_agent_credited_seconds_total":       metrics.CreditedSeconds,
 		"costfluent_agent_kubelet_body_truncated_total": metrics.KubeletBodiesTruncated,
 		"costfluent_agent_info":                         metrics.Info,
+		"costfluent_agent_volumes_dropped_total":        metrics.VolumesDropped,
+		"costfluent_agent_storage_unreadable":           metrics.StorageUnreadable,
 	}
 	for name, c := range collectors {
 		var already prometheus.AlreadyRegisteredError
@@ -52,7 +54,8 @@ func TestMetrics_PassPrometheusLint(t *testing.T) {
 		"costfluent_agent_buffer_reports", "costfluent_agent_buffer_bytes",
 		"costfluent_agent_buffer_dropped_total", "costfluent_agent_map_entries_dropped_total",
 		"costfluent_agent_over_supported_size", "costfluent_agent_elapsed_seconds_total",
-		"costfluent_agent_credited_seconds_total", "costfluent_agent_kubelet_body_truncated_total", "costfluent_agent_info")
+		"costfluent_agent_credited_seconds_total", "costfluent_agent_kubelet_body_truncated_total", "costfluent_agent_info",
+		"costfluent_agent_volumes_dropped_total", "costfluent_agent_storage_unreadable")
 	if err != nil {
 		t.Fatal(err)
 	}

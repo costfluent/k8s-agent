@@ -31,6 +31,9 @@
       "capacity_cpu_cores": 8,
       "capacity_memory_bytes": 34359738368,
       "capacity_gpu": 1,
+      "gpu_resources": {
+        "nvidia.com/gpu": 1
+      },
       "allocatable_cpu_cores": 7.9,
       "allocatable_memory_bytes": 33285996544,
       "annotations": {
@@ -89,6 +92,9 @@
           "cpu_request_cores": 2,
           "memory_request_bytes": 4294967296,
           "gpu_request": 1,
+          "gpu_requests": {
+            "nvidia.com/gpu": 1
+          },
           "cpu_usage_core_seconds": 4500,
           "memory_usage_byte_seconds": 5153960755200,
           "cpu_allocated_core_seconds": 4500,
@@ -109,7 +115,37 @@
           "cpu_usage_peak_cores": 0.01,
           "memory_usage_peak_bytes": 20971520
         }
+      ],
+      "claims": [
+        "data-trainer-0"
       ]
+    }
+  ],
+  "volumes": [
+    {
+      "name": "pvc-cf675ad5-0d5a-4a4c-9a39-3a3b8f6c1d2e",
+      "capacity_bytes": 107374182400,
+      "storage_class": "managed-csi",
+      "csi_driver": "disk.csi.azure.com",
+      "volume_handle": "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/mc_rg_aks_westeurope/providers/Microsoft.Compute/disks/pvc-cf675ad5-0d5a-4a4c-9a39-3a3b8f6c1d2e",
+      "phase": "Bound",
+      "claim_namespace": "ml",
+      "claim_name": "data-trainer-0",
+      "observed_seconds": 3600,
+      "claim_labels": {
+        "app": "trainer"
+      }
+    },
+    {
+      "name": "pvc-0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d",
+      "capacity_bytes": 10737418240,
+      "storage_class": "local-path",
+      "csi_driver": "rancher.io/local-path",
+      "phase": "Released",
+      "observed_seconds": 3600,
+      "storage_class_annotations": {
+        "costfluent.com/storage-gb-hourly-rate": "0.0001"
+      }
     }
   ]
 }

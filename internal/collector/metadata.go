@@ -29,7 +29,7 @@ import (
 )
 
 const (
-	gpuResource            = corev1.ResourceName("nvidia.com/gpu")
+	gpuResource            = corev1.ResourceName(v1.ResourceNVIDIAGPU)
 	namespaceLabelsRefresh = 5 * time.Minute
 	cacheSyncTimeout       = 5 * time.Minute
 	listPageSize           = 500
@@ -54,6 +54,8 @@ type ContainerSpec struct {
 	CPURequestCores    float64
 	MemoryRequestBytes int64
 	GPURequest         int
+	// GPURequests is nil for a container without GPUs, so the pod cache holds nothing more for it.
+	GPURequests map[string]int
 }
 
 // Metadata reads nodes and pods from informer caches and resolves pod controllers.
@@ -63,6 +65,8 @@ type Metadata struct {
 	logger *zap.Logger
 	nodes  listersv1.NodeLister
 	pods   cache.Store
+	// storage reads volumes beside nodes and pods, never holding them back.
+	storage *storage
 
 	syncTimeout time.Duration
 
@@ -97,6 +101,7 @@ func Collect(ctx context.Context, metadata *Metadata, kubelet *KubeletCollector,
 		return Observation{}, err
 	}
 	obs := Observation{Time: now, Pods: pods}
+	obs.Volumes, _ = metadata.Volumes(ctx)
 	obs.Usage, obs.Unscraped = kubelet.Scrape(ctx, nodes)
 	// Owner resolution and scrapes fall back rather than fail, so a poll cut short reads as a cluster
 	// with no usage and unresolved controllers.
@@ -116,12 +121,15 @@ func NewMetadata(client kubernetes.Interface, cfg *config.Config, logger *zap.Lo
 	if size <= 0 {
 		size = config.DefaultOwnerCacheSize
 	}
-	return &Metadata{client: client, cfg: cfg, logger: logger.Named("metadata"), owners: newOwnerCache(size), syncTimeout: cacheSyncTimeout}
+	logger = logger.Named("metadata")
+	return &Metadata{client: client, cfg: cfg, logger: logger, owners: newOwnerCache(size), syncTimeout: cacheSyncTimeout,
+		storage: newStorage(client, cfg, logger)}
 }
 
-// Start runs the node and pod informers until ctx ends and waits for their first sync. Each lists
-// in pages that are cut down to what the agent reads before the next page arrives, so the whole
-// cluster is never held in memory as the API server sent it.
+// Start runs the node, pod and storage informers until ctx ends and waits for the node and pod
+// ones' first sync. Each lists in pages that are cut down to what the agent reads before the next
+// page arrives, so the whole cluster is never held in memory as the API server sent it. Storage is
+// not waited for: an agent whose ClusterRole predates it reports nodes and pods all the same.
 func (m *Metadata) Start(ctx context.Context) error {
 	core := m.client.CoreV1()
 	nodes := cache.NewSharedIndexInformer(pagedListWatch{&cache.ListWatch{
@@ -175,6 +183,9 @@ func (m *Metadata) Start(ctx context.Context) error {
 	}
 	m.nodes = listersv1.NewNodeLister(nodes.GetIndexer())
 	m.pods = pods.GetStore()
+	if err := m.storage.start(ctx); err != nil {
+		return err
+	}
 	go nodes.Run(ctx.Done())
 	go pods.Run(ctx.Done())
 	syncCtx, cancel := context.WithTimeout(ctx, m.syncTimeout)
@@ -225,15 +236,43 @@ func listPages[T, C any](ctx context.Context, opts metav1.ListOptions,
 // stripNode cuts a node down, in place, to what ConvertNode and the kubelet scrape read.
 func stripNode(n *corev1.Node) {
 	*n = corev1.Node{
-		ObjectMeta: metav1.ObjectMeta{Name: n.Name, Labels: n.Labels, Annotations: keepKeys(n.Annotations, v1.RateAnnotations)},
+		ObjectMeta: metav1.ObjectMeta{Name: n.Name, Labels: n.Labels, Annotations: keepKeys(n.Annotations, v1.ForwardedAnnotations)},
 		Spec:       corev1.NodeSpec{ProviderID: n.Spec.ProviderID},
 		Status: corev1.NodeStatus{
-			Capacity:        keepResources(n.Status.Capacity, corev1.ResourceCPU, corev1.ResourceMemory, gpuResource),
+			Capacity:        keepCapacity(n.Status.Capacity),
 			Allocatable:     keepResources(n.Status.Allocatable, corev1.ResourceCPU, corev1.ResourceMemory),
 			Addresses:       n.Status.Addresses,
 			DaemonEndpoints: n.Status.DaemonEndpoints,
 		},
 	}
+}
+
+// keepCapacity returns a node's capacity of CPU, memory and every GPU family, reusing r when
+// nothing is dropped.
+func keepCapacity(r corev1.ResourceList) corev1.ResourceList {
+	kept := 0
+	for name := range r {
+		if keptCapacity(name) {
+			kept++
+		}
+	}
+	if kept == len(r) {
+		return r
+	}
+	if kept == 0 {
+		return nil
+	}
+	out := make(corev1.ResourceList, kept)
+	for name, q := range r {
+		if keptCapacity(name) {
+			out[name] = q
+		}
+	}
+	return out
+}
+
+func keptCapacity(name corev1.ResourceName) bool {
+	return name == corev1.ResourceCPU || name == corev1.ResourceMemory || v1.IsGPUResource(string(name))
 }
 
 // keepKeys returns m without the keys outside allowed, reusing m when nothing is dropped.
@@ -313,10 +352,14 @@ func ConvertNode(node *corev1.Node) v1.Node {
 		CapacityCPUCores:       cores(node.Status.Capacity.Cpu()),
 		CapacityMemoryBytes:    bytesOf(node.Status.Capacity.Memory()),
 		CapacityGPU:            gpus,
+		GPUResources:           gpuCounts(node.Status.Capacity, nil),
 		AllocatableCPUCores:    cores(node.Status.Allocatable.Cpu()),
 		AllocatableMemoryBytes: bytesOf(node.Status.Allocatable.Memory()),
 		Labels:                 fitMap(node.Labels, "node_labels"),
-		Annotations:            fitMap(pick(node.Annotations, v1.RateAnnotations, 0), "node_annotations"),
+		Annotations:            fitMap(pick(node.Annotations, v1.ForwardedAnnotations, 0), "node_annotations"),
+		// Read before the label cap: GPU Feature Discovery's labels sort after the dozens Node
+		// Feature Discovery writes, so the first MaxMapEntries labels rarely hold them.
+		GPULabels: pick(node.Labels, v1.GPULabels, 0),
 	}
 }
 
@@ -346,6 +389,12 @@ func (m *Metadata) Pods(ctx context.Context) ([]PodInfo, error) {
 	return out, nil
 }
 
+// Volumes returns every persistent volume, sorted by name, and false while storage cannot be read,
+// when a report leaves volumes out.
+func (m *Metadata) Volumes(ctx context.Context) ([]v1.Volume, bool) {
+	return m.storage.read(ctx)
+}
+
 func (m *Metadata) podInfo(ctx context.Context, pod *cachedPod, nsLabels map[string]map[string]string) PodInfo {
 	kind, name := m.resolveController(ctx, pod)
 	return PodInfo{
@@ -358,9 +407,47 @@ func (m *Metadata) podInfo(ctx context.Context, pod *cachedPod, nsLabels map[str
 			Labels:          fitMap(pod.Labels, "pod_labels"),
 			Annotations:     fitMap(pod.Annotations, "pod_annotations"),
 			NamespaceLabels: nsLabels[pod.Namespace],
+			Claims:          pod.Claims,
 		},
 		Specs: pod.Containers,
 	}
+}
+
+// gpuCounts returns the whole count of each GPU family resource in primary, falling back to
+// fallback, within the API's caps: the first MaxGPUMapEntries names in order whose name and count
+// fit. Nil when there is none.
+func gpuCounts(primary, fallback corev1.ResourceList) map[string]int {
+	var names []string
+	for _, list := range []corev1.ResourceList{primary, fallback} {
+		for name := range list {
+			if n := string(name); v1.IsGPUResource(n) && !slices.Contains(names, n) {
+				names = append(names, n)
+			}
+		}
+	}
+	if len(names) == 0 {
+		return nil
+	}
+	slices.Sort(names)
+	var out map[string]int
+	for _, n := range names {
+		q, ok := primary[corev1.ResourceName(n)]
+		if !ok {
+			q = fallback[corev1.ResourceName(n)]
+		}
+		count := q.Value()
+		if count <= 0 || count > v1.MaxGPUUnits || utf16Len(n) > v1.MaxGPUResourceNameLength {
+			continue
+		}
+		if out == nil {
+			out = make(map[string]int, min(len(names), v1.MaxGPUMapEntries))
+		}
+		out[n] = int(count)
+		if len(out) == v1.MaxGPUMapEntries {
+			break
+		}
+	}
+	return out
 }
 
 func gpuRequest(r corev1.ResourceRequirements) int {

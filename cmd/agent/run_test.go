@@ -257,9 +257,9 @@ func stubCluster(t *testing.T, apiURL string) {
 	inClusterConfig = func() (*rest.Config, error) { return &rest.Config{Host: apiURL}, nil }
 }
 
-// fakeKubernetes serves an empty cluster: node, pod and namespace lists with no items, and watches
-// held open until the client leaves. With answer false every request hangs instead, as an API
-// server the agent cannot list from does.
+// fakeKubernetes serves an empty cluster: node, pod, namespace, volume and storage class lists with
+// no items, and watches held open until the client leaves. With answer false every request hangs
+// instead, as an API server the agent cannot list from does.
 func fakeKubernetes(t *testing.T, answer bool) string {
 	t.Helper()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -274,13 +274,19 @@ func fakeKubernetes(t *testing.T, answer bool) string {
 			<-r.Context().Done()
 			return
 		}
-		kind := map[string]string{"/api/v1/nodes": "NodeList", "/api/v1/pods": "PodList", "/api/v1/namespaces": "NamespaceList"}[r.URL.Path]
+		kind, apiVersion := map[string]string{
+			"/api/v1/nodes": "NodeList", "/api/v1/pods": "PodList", "/api/v1/namespaces": "NamespaceList",
+			"/api/v1/persistentvolumes": "PersistentVolumeList", "/apis/storage.k8s.io/v1/storageclasses": "StorageClassList",
+		}[r.URL.Path], "v1"
+		if kind == "StorageClassList" {
+			apiVersion = "storage.k8s.io/v1"
+		}
 		if kind == "" {
 			t.Errorf("fake Kubernetes API: unexpected request %s %s", r.Method, r.URL)
 			http.NotFound(w, r)
 			return
 		}
-		_, _ = fmt.Fprintf(w, `{"kind":%q,"apiVersion":"v1","metadata":{"resourceVersion":"1"},"items":[]}`, kind)
+		_, _ = fmt.Fprintf(w, `{"kind":%q,"apiVersion":%q,"metadata":{"resourceVersion":"1"},"items":[]}`, kind, apiVersion)
 	}))
 	t.Cleanup(func() {
 		srv.CloseClientConnections()

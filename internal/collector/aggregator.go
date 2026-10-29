@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
 	"slices"
@@ -25,6 +26,8 @@ type Observation struct {
 	Nodes []v1.Node
 	Pods  []PodInfo
 	Usage map[ContainerKey]ContainerUsage
+	// Volumes is every persistent volume; nil when storage could not be read.
+	Volumes []v1.Volume
 	// Unscraped names the nodes whose kubelet scrape failed: their usage is unknown, so the poll
 	// did not observe them or their pods.
 	Unscraped map[string]bool
@@ -62,6 +65,7 @@ type Aggregator struct {
 	lastDuration time.Duration
 	nodes        map[string]*v1.Node
 	pods         map[podKey]*podAccum
+	volumes      map[string]*v1.Volume
 }
 
 // NewAggregator opens the short first window at now. interval is the polling interval, used to
@@ -80,6 +84,7 @@ func (a *Aggregator) open(start, end time.Time) {
 	a.start, a.end = start, end
 	a.nodes = map[string]*v1.Node{}
 	a.pods = map[podKey]*podAccum{}
+	a.volumes = map[string]*v1.Volume{}
 }
 
 // Observe adds one poll and returns the windows it closed. The first observation only sets the
@@ -120,7 +125,7 @@ func (a *Aggregator) Observe(obs Observation) []v1.Report {
 func (a *Aggregator) closeUntil(t time.Time) []v1.Report {
 	var closed []v1.Report
 	for !t.Before(a.end) {
-		if r, ok := a.report(a.end); ok {
+		if r, ok := a.closeWindow(a.end); ok {
 			closed = append(closed, r)
 		}
 		start := maxTime(a.end, t.Truncate(time.Hour))
@@ -133,7 +138,7 @@ func (a *Aggregator) closeUntil(t time.Time) []v1.Report {
 // nothing.
 func (a *Aggregator) Finish(now time.Time) (v1.Report, bool) {
 	end := minTime(now.UTC(), a.end)
-	r, ok := a.report(end)
+	r, ok := a.closeWindow(end)
 	a.open(end, nextHour(end))
 	return r, ok
 }
@@ -155,6 +160,16 @@ func (a *Aggregator) apply(obs Observation, seconds float64) {
 		node.ObservedSeconds = observed + seconds
 		a.nodes[n.Name] = &node
 	}
+	// A volume has no node, so it is observed whenever storage was read.
+	for _, v := range obs.Volumes {
+		observed := 0.0
+		if acc, ok := a.volumes[v.Name]; ok {
+			observed = acc.ObservedSeconds
+		}
+		vol := v
+		vol.ObservedSeconds = observed + seconds
+		a.volumes[v.Name] = &vol
+	}
 	for _, p := range obs.Pods {
 		if obs.Unscraped[p.Node] {
 			continue
@@ -172,6 +187,7 @@ func (a *Aggregator) apply(obs Observation, seconds float64) {
 			c.CPURequestCores = spec.CPURequestCores
 			c.MemoryRequestBytes = spec.MemoryRequestBytes
 			c.GPURequest = spec.GPURequest
+			c.GPURequests = spec.GPURequests
 
 			u := obs.Usage[ContainerKey{p.Namespace, p.Name, spec.Name}]
 			cpu := 0.0
@@ -188,6 +204,15 @@ func (a *Aggregator) apply(obs Observation, seconds float64) {
 			c.MemoryUsagePeakBytes = max(c.MemoryUsagePeakBytes, u.MemoryBytes)
 		}
 	}
+}
+
+// closeWindow is the report of a closing window, counting the volumes past the cap it leaves out.
+func (a *Aggregator) closeWindow(end time.Time) (v1.Report, bool) {
+	r, ok := a.report(end)
+	if dropped := len(a.volumes) - len(r.Volumes); ok && dropped > 0 {
+		metrics.VolumesDropped.Add(float64(dropped))
+	}
+	return r, ok
 }
 
 func (a *Aggregator) report(end time.Time) (v1.Report, bool) {
@@ -221,7 +246,23 @@ func (a *Aggregator) report(end time.Time) (v1.Report, bool) {
 		}
 		return x.Node < y.Node
 	})
+	r.Volumes = a.sentVolumes()
 	return r, len(r.Nodes) > 0 && end.After(a.start)
+}
+
+// sentVolumes is the window's volumes by name, the first MaxVolumes of them: past the cap the API
+// would refuse the window, compute included. Nil when none was seen.
+func (a *Aggregator) sentVolumes() []v1.Volume {
+	if len(a.volumes) == 0 {
+		return nil
+	}
+	names := slices.Sorted(maps.Keys(a.volumes))
+	names = names[:min(len(names), v1.MaxVolumes)]
+	out := make([]v1.Volume, len(names))
+	for i, name := range names {
+		out[i] = *a.volumes[name]
+	}
+	return out
 }
 
 type snapshot struct {
@@ -302,6 +343,10 @@ func (a *Aggregator) RestoreSnapshot(path string, now time.Time) (*v1.Report, er
 	for i := range r.Nodes {
 		n := r.Nodes[i]
 		a.nodes[n.Name] = &n
+	}
+	for i := range r.Volumes {
+		v := r.Volumes[i]
+		a.volumes[v.Name] = &v
 	}
 	for _, p := range r.Pods {
 		acc := &podAccum{pod: p, containers: p.Containers}

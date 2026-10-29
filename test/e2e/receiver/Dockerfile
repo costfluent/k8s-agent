@@ -3,5 +3,5 @@
 FROM scratch
 COPY receiver /receiver
 USER 1000:1000
-EXPOSE 8080
+EXPOSE 8080 8443
 ENTRYPOINT ["/receiver"]

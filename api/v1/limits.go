@@ -12,6 +12,23 @@ const (
 	MaxMapEntries       = 128
 	MaxMapKeyLength     = 317
 	MaxMapValueLength   = 1024
+	// MaxGPUMapEntries caps gpu_resources, gpu_labels and gpu_requests.
+	MaxGPUMapEntries = 16
+	// MaxGPUResourceNameLength caps a key of gpu_resources and gpu_requests: a family's
+	// nvidia.com/ prefix and a 63-character name, the longest a Kubernetes resource name has.
+	MaxGPUResourceNameLength = 74
+	// MaxGPUUnits caps a count in gpu_resources and gpu_requests, far above any node's devices and
+	// replicas.
+	MaxGPUUnits = 16384
+	// MaxVolumes caps volumes: a claim for every pod at MaxPods. Past it the agent sends the first by
+	// name and counts the rest, so storage never holds back a window's compute.
+	MaxVolumes = 50000
+	// MaxClaimsPerPod caps a pod's claims; past it a pod keeps its first by name.
+	MaxClaimsPerPod = 32
+	// MaxNameLength caps a name: a volume's, a claim's, a storage class's, a CSI driver's.
+	MaxNameLength = 253
+	// MaxVolumeHandleLength caps a volume handle, as the API caps a node's provider id.
+	MaxVolumeHandleLength = 1024
 )
 
 // CheckSize returns an error naming the first count cap r exceeds. The API refuses such a report

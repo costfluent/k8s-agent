@@ -25,12 +25,27 @@ func fullMap() map[string]string {
 	return m
 }
 
+// fullGPUMaps holds MaxGPUMapEntries labels at the map caps, and as many GPU resources, each named
+// at MaxGPUResourceNameLength and counting MaxGPUUnits.
+func fullGPUMaps() (map[string]string, map[string]int) {
+	prefix := strings.Repeat(strings.Repeat("a", 61)+".", 4) + "e.com"
+	labels := make(map[string]string, MaxGPUMapEntries)
+	resources := make(map[string]int, MaxGPUMapEntries)
+	for i := range MaxGPUMapEntries {
+		labels[fmt.Sprintf("%s/k%062d", prefix, i)] = fmt.Sprintf("%0*d", MaxMapValueLength, i)
+		resources[fmt.Sprintf("%s%0*d", ResourceNVIDIAMIGPrefix, MaxGPUResourceNameLength-len(ResourceNVIDIAMIGPrefix), i)] = MaxGPUUnits
+	}
+	return labels, resources
+}
+
 // atLimitsReport is a report exactly at every cap: MaxNodes nodes, MaxPods pods, a pod with
-// MaxContainersPerPod containers, and full label and annotation maps. Names are as long as
-// Kubernetes allows.
+// MaxContainersPerPod containers, each with full GPU requests, and MaxClaimsPerPod claims, MaxVolumes
+// volumes, and full label, annotation, GPU and claim label maps. Names are as long as Kubernetes
+// allows.
 func atLimitsReport() Report {
 	start := time.Date(2026, 9, 23, 10, 0, 0, 0, time.UTC)
 	full := fullMap()
+	gpuLabels, gpuResources := fullGPUMaps()
 	r := Report{
 		SchemaVersion:   SchemaVersion,
 		ClusterID:       "pve-dev",
@@ -40,6 +55,7 @@ func atLimitsReport() Report {
 		WindowEnd:       start.Add(time.Hour),
 		Nodes:           make([]Node, 0, MaxNodes),
 		Pods:            make([]Pod, 0, MaxPods),
+		Volumes:         make([]Volume, 0, MaxVolumes),
 	}
 	for i := range MaxNodes {
 		r.Nodes = append(r.Nodes, Node{
@@ -62,6 +78,8 @@ func atLimitsReport() Report {
 	first.Zone = strings.Repeat("z", 63)
 	first.Labels = full
 	first.Annotations = full
+	first.GPUResources = gpuResources
+	first.GPULabels = gpuLabels
 
 	for i := range MaxPods {
 		r.Pods = append(r.Pods, Pod{
@@ -94,8 +112,36 @@ func atLimitsReport() Report {
 	pod.NamespaceLabels = full
 	pod.Containers = make([]Container, 0, MaxContainersPerPod)
 	for i := range MaxContainersPerPod {
-		pod.Containers = append(pod.Containers, Container{Name: fmt.Sprintf("c-%061d", i), ObservedSeconds: 3600})
+		pod.Containers = append(pod.Containers, Container{Name: fmt.Sprintf("c-%061d", i), ObservedSeconds: 3600, GPURequests: gpuResources})
 	}
+	pod.Claims = make([]string, 0, MaxClaimsPerPod)
+	for i := range MaxClaimsPerPod {
+		pod.Claims = append(pod.Claims, fmt.Sprintf("claim-%0247d", i))
+	}
+
+	for i := range MaxVolumes {
+		r.Volumes = append(r.Volumes, Volume{
+			Name:            fmt.Sprintf("pvc-%05d", i),
+			CapacityBytes:   10737418240,
+			StorageClass:    "gp3",
+			CSIDriver:       "ebs.csi.aws.com",
+			VolumeHandle:    fmt.Sprintf("vol-%017x", i),
+			Phase:           "Bound",
+			ClaimNamespace:  r.Pods[i].Namespace,
+			ClaimName:       fmt.Sprintf("data-%05d", i),
+			ObservedSeconds: 3600,
+		})
+	}
+	volume := &r.Volumes[0]
+	volume.Name = fmt.Sprintf("pvc-%0249d", 0)
+	volume.StorageClass = fmt.Sprintf("class-%0247d", 0)
+	volume.CSIDriver = fmt.Sprintf("driver-%0246d", 0)
+	volume.VolumeHandle = "vol-" + strings.Repeat("v", MaxVolumeHandleLength-len("vol-"))
+	volume.Phase = fmt.Sprintf("phase-%0247d", 0)
+	volume.ClaimNamespace = pod.Namespace
+	volume.ClaimName = pod.Claims[0]
+	volume.StorageClassAnnotations = full
+	volume.ClaimLabels = full
 	return r
 }
 

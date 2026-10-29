@@ -9,6 +9,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 
+	v1 "github.com/costfluent/k8s-agent/api/v1"
 	"github.com/costfluent/k8s-agent/internal/config"
 )
 
@@ -20,6 +21,8 @@ type cachedPod struct {
 	OwnerKind, OwnerName         string
 	Labels, Annotations          map[string]string
 	Containers                   []ContainerSpec
+	// Claims names the claims the pod mounts; nil when none.
+	Claims []string
 }
 
 func (p *cachedPod) GetObjectKind() schema.ObjectKind { return schema.EmptyObjectKind }
@@ -62,6 +65,7 @@ func (m *Metadata) cachePod(p *corev1.Pod) *cachedPod {
 		Phase:       intern(string(p.Status.Phase)),
 		Labels:      m.cachedLabels(p.Labels),
 		Annotations: cachedAnnotations(p.Annotations, m.cfg.AllowedAnnotations),
+		Claims:      podClaims(p),
 	}
 	ref := metav1.GetControllerOf(p)
 	if ref == nil && len(p.OwnerReferences) > 0 {
@@ -90,6 +94,34 @@ func (m *Metadata) cachePod(p *corev1.Pod) *cachedPod {
 	return c
 }
 
+// podClaims names the claims p mounts: each persistentVolumeClaim volume's, and each generic
+// ephemeral volume's as Kubernetes names it, <pod>-<volume>. Sorted, the first MaxClaimsPerPod, and
+// nil when there is none; a name past the API's cap would refuse the whole report, so it is left out.
+func podClaims(p *corev1.Pod) []string {
+	var out []string
+	for i := range p.Spec.Volumes {
+		vol := &p.Spec.Volumes[i]
+		var name string
+		switch {
+		case vol.PersistentVolumeClaim != nil:
+			name = vol.PersistentVolumeClaim.ClaimName
+		case vol.Ephemeral != nil:
+			name = p.Name + "-" + vol.Name
+		default:
+			continue
+		}
+		if name != "" && utf16Len(name) <= v1.MaxNameLength {
+			out = append(out, intern(name))
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	slices.Sort(out)
+	out = slices.Compact(out)
+	return slices.Clip(out[:min(len(out), v1.MaxClaimsPerPod)])
+}
+
 // isSidecar reports a native sidecar: an init container that keeps running beside the pod's
 // containers for the pod's whole life. Other init containers finish before the pod is Running.
 func isSidecar(ct *corev1.Container) bool {
@@ -102,6 +134,7 @@ func containerSpec(ct *corev1.Container) ContainerSpec {
 		CPURequestCores:    cores(ct.Resources.Requests.Cpu()),
 		MemoryRequestBytes: bytesOf(ct.Resources.Requests.Memory()),
 		GPURequest:         gpuRequest(ct.Resources),
+		GPURequests:        gpuCounts(ct.Resources.Requests, ct.Resources.Limits),
 	}
 }
 
