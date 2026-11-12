@@ -38,9 +38,10 @@ import (
 	v1 "github.com/costfluent/k8s-agent/api/v1"
 )
 
-// The cluster's shape. Every count is fixed, so two runs measure the same cluster.
+// The cluster's shape. Every count is fixed, so two runs measure the same cluster; the node and pod
+// counts are the API's caps.
 const (
-	nodeCount          = 1000
+	nodeCount          = v1.MaxNodes
 	daemonSetsPerNode  = 5
 	statefulSets       = 100
 	podsPerStatefulSet = 10

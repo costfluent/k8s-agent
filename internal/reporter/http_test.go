@@ -74,7 +74,7 @@ func TestClient_SendsGzipBearerReportAndClassifiesStatus(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			res := NewClient(u, "cf_org_x", "0.2.0", nil).Send(context.Background(), body)
+			res := NewClient(u, "cf_org_x", "0.2.0", nil, nil).Send(context.Background(), body)
 			if res.Outcome != tc.want || res.Status != tc.status {
 				t.Fatalf("result = %+v, want outcome %v", res, tc.want)
 			}
@@ -90,7 +90,7 @@ func TestClient_SendsGzipBearerReportAndClassifiesStatus(t *testing.T) {
 
 func TestClient_NetworkErrorIsRetried(t *testing.T) {
 	u, _ := url.Parse("http://127.0.0.1:1")
-	if res := NewClient(u, "t", "v", nil).Send(context.Background(), []byte("x")); res.Outcome != Retry {
+	if res := NewClient(u, "t", "v", nil, nil).Send(context.Background(), []byte("x")); res.Outcome != Retry {
 		t.Fatalf("result = %+v", res)
 	}
 }
@@ -192,7 +192,7 @@ func TestClient_ReadsRetryAfterAsSecondsOrADate(t *testing.T) {
 			}))
 			defer srv.Close()
 			u, _ := url.Parse(srv.URL)
-			c := NewClient(u, "t", "v", nil)
+			c := NewClient(u, "t", "v", nil, nil)
 			c.now = func() time.Time { return now }
 			res := c.Send(context.Background(), []byte("x"))
 			if res.Outcome != Retry || res.RetryAfter != tc.want {
@@ -214,7 +214,7 @@ func TestSender_ATooLargeReportDoesNotBlockLaterOnes(t *testing.T) {
 	defer srv.Close()
 	u, _ := url.Parse(srv.URL)
 	b := newBuffer(t, 1, 2)
-	s, _, _ := observedSender(t, b, NewClient(u, "t", "v", nil))
+	s, _, _ := observedSender(t, b, NewClient(u, "t", "v", nil, nil))
 
 	s.Drain(context.Background(), false)
 
@@ -249,7 +249,7 @@ func TestClient_ReadsTheAPIsTimeAndHowFarTheClockIsAheadFromDate(t *testing.T) {
 			}))
 			defer srv.Close()
 			u, _ := url.Parse(srv.URL)
-			c := NewClient(u, "t", "v", nil)
+			c := NewClient(u, "t", "v", nil, nil)
 			c.now = func() time.Time { return tc.node }
 
 			res := c.Send(context.Background(), []byte("x"))
@@ -302,7 +302,7 @@ func TestSender_KeepsAReportRefusedAsEndingInTheFutureUntilTheAPIsClockPassesIts
 			}))
 			defer srv.Close()
 			u, _ := url.Parse(srv.URL)
-			client := NewClient(u, "t", "v", nil)
+			client := NewClient(u, "t", "v", nil, nil)
 			client.now = func() time.Time { return tc.node }
 			b := newBuffer(t, 1)
 			s, c, logs := observedSender(t, b, client)
@@ -334,7 +334,7 @@ func TestSender_KeepsAReportRefusedAsEndingInTheFutureUntilTheAPIsClockPassesIts
 // revoked or its creator's account was disabled or deleted; the advice says so and how to replace it.
 func TestAdvice_UnauthorizedSaysWhyATokenStopsAndHowToReplaceIt(t *testing.T) {
 	got := Advice(Result{Status: http.StatusUnauthorized})
-	for _, want := range []string{"revoked", "disabled or deleted", "Mint token on the cluster", "revoke the old one"} {
+	for _, want := range []string{"revoked", "disabled or deleted", "New token on the cluster", "revoke the old one"} {
 		if !strings.Contains(got, want) {
 			t.Errorf("Advice(401) = %q, want it to contain %q", got, want)
 		}

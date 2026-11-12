@@ -28,9 +28,9 @@ type Observation struct {
 	Usage map[ContainerKey]ContainerUsage
 	// Volumes is every persistent volume; nil when storage could not be read.
 	Volumes []v1.Volume
-	// Unscraped names the nodes whose kubelet scrape failed: their usage is unknown, so the poll
-	// did not observe them or their pods.
-	Unscraped map[string]bool
+	// Unscraped names the nodes whose kubelet scrape failed, each with its v1.Unscraped* reason:
+	// their usage is unknown, so the poll did not observe them or their pods.
+	Unscraped map[string]string
 	// Duration is how long the poll took to collect.
 	Duration time.Duration
 }
@@ -66,6 +66,9 @@ type Aggregator struct {
 	nodes        map[string]*v1.Node
 	pods         map[podKey]*podAccum
 	volumes      map[string]*v1.Volume
+	// unscraped is the last reason of each node whose scrape failed in the window; one also in nodes
+	// was read at another poll and is not counted.
+	unscraped map[string]string
 }
 
 // NewAggregator opens the short first window at now. interval is the polling interval, used to
@@ -85,6 +88,7 @@ func (a *Aggregator) open(start, end time.Time) {
 	a.nodes = map[string]*v1.Node{}
 	a.pods = map[podKey]*podAccum{}
 	a.volumes = map[string]*v1.Volume{}
+	a.unscraped = map[string]string{}
 }
 
 // Observe adds one poll and returns the windows it closed. The first observation only sets the
@@ -148,7 +152,8 @@ func (a *Aggregator) apply(obs Observation, seconds float64) {
 		return
 	}
 	for _, n := range obs.Nodes {
-		if obs.Unscraped[n.Name] {
+		if reason := obs.Unscraped[n.Name]; reason != "" {
+			a.unscraped[n.Name] = reason
 			continue
 		}
 		acc, ok := a.nodes[n.Name]
@@ -171,7 +176,7 @@ func (a *Aggregator) apply(obs Observation, seconds float64) {
 		a.volumes[v.Name] = &vol
 	}
 	for _, p := range obs.Pods {
-		if obs.Unscraped[p.Node] {
+		if obs.Unscraped[p.Node] != "" {
 			continue
 		}
 		key := podKey{p.Namespace, p.Name, p.Node}
@@ -247,7 +252,13 @@ func (a *Aggregator) report(end time.Time) (v1.Report, bool) {
 		return x.Node < y.Node
 	})
 	r.Volumes = a.sentVolumes()
-	return r, len(r.Nodes) > 0 && end.After(a.start)
+	r.UnscrapedNodes = map[string]int{}
+	for node, reason := range a.unscraped {
+		if _, read := a.nodes[node]; !read {
+			r.UnscrapedNodes[reason]++
+		}
+	}
+	return r, (len(r.Nodes) > 0 || len(r.UnscrapedNodes) > 0) && end.After(a.start)
 }
 
 // sentVolumes is the window's volumes by name, the first MaxVolumes of them: past the cap the API
@@ -265,9 +276,12 @@ func (a *Aggregator) sentVolumes() []v1.Volume {
 	return out
 }
 
+// snapshot is the open window as the agent keeps it on its own volume. Unscraped keeps each failed
+// node's reason, which the report only counts, so a node read after a restart is not counted.
 type snapshot struct {
-	LastSample time.Time `json:"last_sample"`
-	Report     v1.Report `json:"report"`
+	LastSample time.Time         `json:"last_sample"`
+	Unscraped  map[string]string `json:"unscraped,omitempty"`
+	Report     *v1.Report        `json:"report,omitempty"`
 }
 
 // SaveSnapshot writes the open window to path atomically, so a crash loses at most the time since.
@@ -275,7 +289,7 @@ type snapshot struct {
 func (a *Aggregator) SaveSnapshot(path string) error {
 	r, _ := a.report(a.end)
 	tmp := path + ".tmp"
-	if err := writeSnapshot(tmp, a.lastSample, r); err != nil {
+	if err := writeSnapshot(tmp, a.lastSample, r, a.unscraped); err != nil {
 		return fmt.Errorf("writing window snapshot: %w", err)
 	}
 	if err := os.Rename(tmp, path); err != nil {
@@ -284,7 +298,7 @@ func (a *Aggregator) SaveSnapshot(path string) error {
 	return nil
 }
 
-func writeSnapshot(path string, lastSample time.Time, r v1.Report) (err error) {
+func writeSnapshot(path string, lastSample time.Time, r v1.Report, unscraped map[string]string) (err error) {
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600) //nolint:gosec // path is under the agent's own data directory
 	if err != nil {
 		return err
@@ -295,11 +309,12 @@ func writeSnapshot(path string, lastSample time.Time, r v1.Report) (err error) {
 		}
 	}()
 	w := bufio.NewWriterSize(f, 64<<10)
-	sample, err := json.Marshal(lastSample)
+	head, err := json.Marshal(snapshot{LastSample: lastSample, Unscraped: unscraped})
 	if err != nil {
 		return err
 	}
-	if _, err := fmt.Fprintf(w, `{"last_sample":%s,"report":`, sample); err != nil {
+	// The report streams after the other members, in place of the object's closing brace.
+	if _, err := fmt.Fprintf(w, `%s,"report":`, head[:len(head)-1]); err != nil {
 		return err
 	}
 	if err := v1.WriteJSON(w, r); err != nil {
@@ -328,9 +343,16 @@ func (a *Aggregator) RestoreSnapshot(path string, now time.Time) (*v1.Report, er
 	if err := json.Unmarshal(data, &s); err != nil {
 		return nil, fmt.Errorf("decoding window snapshot %s: %w", filepath.Base(path), err)
 	}
-	r := s.Report
-	if r.ClusterID != a.clusterID || len(r.Nodes) == 0 {
+	if s.Report == nil {
 		return nil, nil
+	}
+	r := *s.Report
+	if r.ClusterID != a.clusterID || (len(r.Nodes) == 0 && len(r.UnscrapedNodes) == 0) {
+		return nil, nil
+	}
+	if r.UnscrapedNodes == nil {
+		// A snapshot from an agent that did not count unscraped nodes.
+		r.UnscrapedNodes = map[string]int{}
 	}
 	if !now.UTC().Before(r.WindowEnd) {
 		r.AgentVersion = a.version
@@ -340,6 +362,7 @@ func (a *Aggregator) RestoreSnapshot(path string, now time.Time) (*v1.Report, er
 
 	a.open(r.WindowStart, r.WindowEnd)
 	a.lastSample = time.Time{}
+	maps.Copy(a.unscraped, s.Unscraped)
 	for i := range r.Nodes {
 		n := r.Nodes[i]
 		a.nodes[n.Name] = &n

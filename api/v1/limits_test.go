@@ -53,9 +53,13 @@ func atLimitsReport() Report {
 		AgentInstanceID: "6f1c1d2e-3a4b-4c5d-8e9f-0a1b2c3d4e5f",
 		WindowStart:     start,
 		WindowEnd:       start.Add(time.Hour),
-		Nodes:           make([]Node, 0, MaxNodes),
-		Pods:            make([]Pod, 0, MaxPods),
-		Volumes:         make([]Volume, 0, MaxVolumes),
+		UnscrapedNodes: map[string]int{
+			UnscrapedTLS: MaxNodes / 4, UnscrapedUnreachable: MaxNodes / 4,
+			UnscrapedUnauthorized: MaxNodes / 4, UnscrapedOther: MaxNodes / 4,
+		},
+		Nodes:   make([]Node, 0, MaxNodes),
+		Pods:    make([]Pod, 0, MaxPods),
+		Volumes: make([]Volume, 0, MaxVolumes),
 	}
 	for i := range MaxNodes {
 		r.Nodes = append(r.Nodes, Node{
@@ -198,6 +202,14 @@ func TestReport_CheckSizeAcceptsTheCapsAndRefusesOneMore(t *testing.T) {
 	}{
 		{"one node more", func(r *Report) { r.Nodes = append(r.Nodes, Node{Name: "extra"}) }, "1001 nodes; the API accepts at most 1000"},
 		{"one pod more", func(r *Report) { r.Pods = append(r.Pods, Pod{Name: "extra"}) }, "50001 pods; the API accepts at most 50000"},
+		{"one unscraped node more", func(r *Report) { r.UnscrapedNodes[UnscrapedTLS]++ }, "1001 unscraped nodes; the API accepts at most 1000"},
+		{"an unscraped count over the cap", func(r *Report) {
+			r.UnscrapedNodes = map[string]int{UnscrapedOther: MaxNodes + 1}
+		}, "unscraped_nodes other is 1001; the API accepts 0 to 1000"},
+		{"a negative unscraped count", func(r *Report) { r.UnscrapedNodes[UnscrapedTLS] = -1 }, "unscraped_nodes tls is -1; the API accepts 0 to 1000"},
+		{"an unknown unscraped reason", func(r *Report) {
+			r.UnscrapedNodes = map[string]int{"x509": 1}
+		}, `unscraped_nodes reason "x509"; the API accepts only [tls unreachable unauthorized other]`},
 		{"one container more", func(r *Report) {
 			p := &r.Pods[len(r.Pods)-1]
 			p.Containers = append(p.Containers, make([]Container, MaxContainersPerPod)...)

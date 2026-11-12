@@ -1,6 +1,16 @@
 package config
 
 import (
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/pem"
+	"errors"
+	"math/big"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -8,9 +18,19 @@ import (
 	corev1 "k8s.io/api/core/v1"
 )
 
+// inChart is what the chart always sets; a test that leaves one out of its values gets it from here,
+// and one that sets it, even to "", overrides it.
+var inChart = map[string]string{
+	"COSTFLUENT_KUBELET_SERVICE_ACCOUNT": "costfluent-k8s-agent-kubelet",
+	"COSTFLUENT_NAMESPACE":               "costfluent",
+}
+
 func env(values map[string]string) func(string) (string, bool) {
 	return func(key string) (string, bool) {
-		v, ok := values[key]
+		if v, ok := values[key]; ok {
+			return v, true
+		}
+		v, ok := inChart[key]
 		return v, ok
 	}
 }
@@ -18,6 +38,8 @@ func env(values map[string]string) func(string) (string, bool) {
 func TestLoad_ReadsRequiredValuesFromEnvironment(t *testing.T) {
 	t.Setenv("COSTFLUENT_TOKEN", "cf_org_secret")
 	t.Setenv("COSTFLUENT_CLUSTER_ID", "pve-dev")
+	t.Setenv("COSTFLUENT_KUBELET_SERVICE_ACCOUNT", "costfluent-k8s-agent-kubelet")
+	t.Setenv("COSTFLUENT_NAMESPACE", "costfluent")
 
 	cfg, err := Load()
 	if err != nil {
@@ -37,6 +59,12 @@ func TestLoad_ReadsRequiredValuesFromEnvironment(t *testing.T) {
 	}
 	if len(cfg.Warnings) != 0 {
 		t.Errorf("warnings = %v", cfg.Warnings)
+	}
+	if cfg.KubeletServiceAccount != "costfluent-k8s-agent-kubelet" || cfg.Namespace != "costfluent" {
+		t.Errorf("kubelet account = %q in %q", cfg.KubeletServiceAccount, cfg.Namespace)
+	}
+	if cfg.ReportRootCAs != nil {
+		t.Errorf("report CAs = %v, want nil so the system pool applies", cfg.ReportRootCAs)
 	}
 }
 
@@ -102,6 +130,8 @@ func TestLoad_RejectsInvalidValues(t *testing.T) {
 		"log level":                {"COSTFLUENT_LOG_LEVEL": "trace"},
 		"log format":               {"COSTFLUENT_LOG_FORMAT": "text"},
 		"namespace labels boolean": {"COSTFLUENT_COLLECT_NAMESPACE_LABELS": "yes please"},
+		"kubelet account name":     {"COSTFLUENT_KUBELET_SERVICE_ACCOUNT": "Not_A_Name"},
+		"namespace name":           {"COSTFLUENT_NAMESPACE": "a.b"},
 	}
 	for name, override := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -224,5 +254,140 @@ func TestParse_CollectPVCLabels(t *testing.T) {
 	if _, err := load(env(map[string]string{"COSTFLUENT_TOKEN": "t", "COSTFLUENT_COLLECT_PVC_LABELS": "yes please"})); err == nil ||
 		!strings.Contains(err.Error(), "COSTFLUENT_COLLECT_PVC_LABELS") {
 		t.Fatalf("err = %v, want one naming COSTFLUENT_COLLECT_PVC_LABELS", err)
+	}
+}
+
+// caPEM is a self-signed CA certificate in PEM, standing in for a TLS-inspecting proxy's CA.
+func caPEM(t *testing.T) (*x509.Certificate, []byte) {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber:          big.NewInt(1),
+		Subject:               pkix.Name{CommonName: "Corporate Inspection CA"},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(time.Hour),
+		IsCA:                  true,
+		BasicConstraintsValid: true,
+		KeyUsage:              x509.KeyUsageCertSign,
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cert, err := x509.ParseCertificate(der)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return cert, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
+}
+
+func writeFile(t *testing.T, content []byte) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "ca.crt")
+	if err := os.WriteFile(path, content, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func TestLoad_ReadsTheReportCAFileIntoTheSystemPool(t *testing.T) {
+	ca, pemBytes := caPEM(t)
+	cfg, err := load(env(map[string]string{"COSTFLUENT_TOKEN": "t", "COSTFLUENT_REPORT_CA_FILE": writeFile(t, pemBytes)}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.ReportRootCAs == nil {
+		t.Fatal("report CAs = nil, want the system pool plus the file's certificate")
+	}
+	if _, err := ca.Verify(x509.VerifyOptions{Roots: cfg.ReportRootCAs}); err != nil {
+		t.Errorf("the file's CA does not verify against the pool: %v", err)
+	}
+	system, err := x509.SystemCertPool()
+	if err != nil {
+		t.Fatal(err)
+	}
+	system.AddCert(ca)
+	if !cfg.ReportRootCAs.Equal(system) {
+		t.Error("the pool is not the system pool plus the file's certificate")
+	}
+}
+
+func TestLoad_RefusesAMissingOrUnreadableReportCAFile(t *testing.T) {
+	for name, path := range map[string]string{
+		"missing":    filepath.Join(t.TempDir(), "missing.crt"),
+		"unreadable": t.TempDir(),
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, err := load(env(map[string]string{"COSTFLUENT_TOKEN": "t", "COSTFLUENT_REPORT_CA_FILE": path}))
+			if err == nil || !strings.Contains(err.Error(), "COSTFLUENT_REPORT_CA_FILE") || !strings.Contains(err.Error(), path) {
+				t.Fatalf("err = %v, want one naming COSTFLUENT_REPORT_CA_FILE and %s", err, path)
+			}
+		})
+	}
+}
+
+func TestLoad_RefusesAReportCAFileWithoutCertificates(t *testing.T) {
+	const content = "-----BEGIN PRIVATE KEY-----\nc2VjcmV0LWtleS1tYXRlcmlhbA==\n-----END PRIVATE KEY-----\n"
+	path := writeFile(t, []byte(content))
+	_, err := load(env(map[string]string{"COSTFLUENT_TOKEN": "t", "COSTFLUENT_REPORT_CA_FILE": path}))
+	if err == nil || !strings.Contains(err.Error(), "COSTFLUENT_REPORT_CA_FILE") || !strings.Contains(err.Error(), path) {
+		t.Fatalf("err = %v, want one naming COSTFLUENT_REPORT_CA_FILE and %s", err, path)
+	}
+	if strings.Contains(err.Error(), "c2VjcmV0") || strings.Contains(err.Error(), "PRIVATE KEY") {
+		t.Errorf("err = %v, which shows the file's content", err)
+	}
+}
+
+// An agent newer than its chart finds no metrics account and keeps the old chart's way of scraping.
+func TestLoad_WithoutTheKubeletAccountWarnsAndScrapesWithTheAgentsOwnToken(t *testing.T) {
+	cfg, err := load(env(map[string]string{"COSTFLUENT_TOKEN": "t", "COSTFLUENT_KUBELET_SERVICE_ACCOUNT": "", "COSTFLUENT_NAMESPACE": ""}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.KubeletServiceAccount != "" {
+		t.Errorf("kubelet account = %q, want none", cfg.KubeletServiceAccount)
+	}
+	if len(cfg.Warnings) != 1 || !strings.Contains(cfg.Warnings[0], "COSTFLUENT_KUBELET_SERVICE_ACCOUNT") {
+		t.Errorf("warnings = %v, want one naming COSTFLUENT_KUBELET_SERVICE_ACCOUNT", cfg.Warnings)
+	}
+}
+
+func TestLoad_RefusesAKubeletAccountWithoutANamespace(t *testing.T) {
+	_, err := load(env(map[string]string{"COSTFLUENT_TOKEN": "t", "COSTFLUENT_NAMESPACE": ""}))
+	if err == nil || !strings.Contains(err.Error(), "COSTFLUENT_NAMESPACE") {
+		t.Fatalf("err = %v, want one naming COSTFLUENT_NAMESPACE", err)
+	}
+}
+
+func TestLoad_ReportsASystemPoolItCannotLoad(t *testing.T) {
+	original := systemCertPool
+	t.Cleanup(func() { systemCertPool = original })
+	systemCertPool = func() (*x509.CertPool, error) { return nil, errors.New("no system roots") }
+	_, pemBytes := caPEM(t)
+	path := writeFile(t, pemBytes)
+	_, err := load(env(map[string]string{"COSTFLUENT_TOKEN": "t", "COSTFLUENT_REPORT_CA_FILE": path}))
+	if err == nil || !strings.Contains(err.Error(), "COSTFLUENT_REPORT_CA_FILE") || !strings.Contains(err.Error(), "no system roots") {
+		t.Fatalf("err = %v, want one naming COSTFLUENT_REPORT_CA_FILE and the cause", err)
+	}
+}
+
+// A proxy URL can carry credentials, and without a scheme url.Parse reads them as the host's
+// password, so the error names the variable and never echoes the value. A value url.Parse rejects
+// outright (an unclosed IPv6 host) is in the list too, because url.Parse's own error quotes the
+// whole value.
+func TestLoad_ProxyErrorNeverShowsTheValue(t *testing.T) {
+	for _, raw := range []string{"user:s3cr3t-pass@proxy:3128", "ftp://user:s3cr3t-pass@proxy:3128", "http://user:s3cr3t-pass@", "http://user:s3cr3t-pass@[::1"} {
+		t.Run(raw, func(t *testing.T) {
+			_, err := load(env(map[string]string{"COSTFLUENT_TOKEN": "t", "COSTFLUENT_REPORT_HTTP_PROXY": raw}))
+			if err == nil || !strings.Contains(err.Error(), "COSTFLUENT_REPORT_HTTP_PROXY") {
+				t.Fatalf("err = %v, want one naming COSTFLUENT_REPORT_HTTP_PROXY", err)
+			}
+			if strings.Contains(err.Error(), "s3cr3t") || strings.Contains(err.Error(), "user") {
+				t.Errorf("err = %v, which shows the proxy's credentials", err)
+			}
+		})
 	}
 }

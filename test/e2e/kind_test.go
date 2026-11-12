@@ -1,10 +1,12 @@
 //go:build e2e
 
-// Package e2e installs the chart into a kind cluster, points the agent at a stub receiver, and
-// asserts that a real report arrives. The agent reports over TLS and trusts the receiver only
-// through the CA bundle its own image ships, extended with the test's CA, so an image that cannot
-// verify the API's certificate fails the run. Run it with `make e2e`; it needs docker, kind,
-// kubectl and helm on the PATH.
+// Package e2e installs the chart into real clusters, points the agent at a stub receiver, and
+// asserts what reaches it. The agent reports over TLS and trusts the receiver's private CA only
+// through agent.reportCABundle, which adds it to the bundle the image ships. Each test is one leg of
+// the kind-smoke job and has its own make target: TestKindSmoke (`make e2e-kind`), TestK3s
+// (`make e2e-k3s`), TestKindReportProxy (`make e2e-proxy`) and TestKindKubeletVerification
+// (`make e2e-kubelet-tls`); `make e2e` runs them all. They need docker, kind, kubectl, helm and go
+// on the PATH.
 package e2e
 
 import (
@@ -24,7 +26,6 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
-	"regexp"
 	"runtime"
 	"slices"
 	"strings"
@@ -39,12 +40,25 @@ const (
 	token         = "cf_k8s_e2e-smoke-token"
 	clusterID     = "kind-e2e"
 	release       = "cfa"
+	agentFullname = release + "-costfluent-k8s-agent"
 	agentImage    = "costfluent-e2e/k8s-agent"
 	receiverImage = "costfluent-e2e/receiver"
 	imageTag      = "e2e"
 	apiEndpoint   = "https://receiver.e2e:8443"
-	fillerPods    = 50
-	reportWithin  = 3 * time.Minute
+	// receiverCA is the ConfigMap in the agent's namespace that agent.reportCABundle names.
+	receiverCA   = "receiver-ca"
+	fillerPods   = 50
+	reportWithin = 3 * time.Minute
+	// pollEvery is the agent.pollingInterval the release is installed with, in seconds.
+	pollEvery = 5
+	// shutdownWithin runs from the return of helm uninstall --wait, not from the stop, and is the
+	// chart's 30 second grace period plus a poll of the receiver: a report later than that was not
+	// sent by the stopped agent.
+	shutdownWithin = 40 * time.Second
+	// hourMargin keeps the stop this far from a clock hour, where the agent closes its window by the
+	// clock: a clock close between the stop and the SIGTERM would leave the shutdown's window starting
+	// at the hour, where no report ending before the stop does, and fail a correct agent.
+	hourMargin = time.Minute
 )
 
 // agentVersion is the VERSION the agent image is built with, which every report must carry as
@@ -65,18 +79,6 @@ const bundlePath = "/etc/ssl/certs/ca-certificates.crt"
 // update never trips it, while an emptied or truncated bundle does.
 const minBundleCertificates = 100
 
-// notInImageTag matches the characters a Docker tag may not hold. A tag is at most 128 characters
-// and may not start with '.' or '-'.
-var notInImageTag = regexp.MustCompile(`[^A-Za-z0-9_.-]`)
-
-// tlsImageTag is the tag of the agent image that trusts this run's CA. Every run commits a
-// different CA, so the tag is per cluster, like the cluster: under one shared tag, concurrent runs
-// on one Docker daemon would load each other's image or remove each other's tag.
-func tlsImageTag(cluster string) string {
-	tag := "e2e-tls-" + notInImageTag.ReplaceAllString(cluster, "-")
-	return tag[:min(len(tag), 128)]
-}
-
 func env(key, fallback string) string {
 	if v := os.Getenv(key); v != "" {
 		return v
@@ -88,6 +90,42 @@ type harness struct {
 	t          *testing.T
 	ctx        context.Context
 	kubeconfig string
+	dir        string
+	moduleRoot string
+	chart      string
+	// storageClass is the class the cluster provisions the agent's claim from.
+	storageClass string
+	// caPEM is the CA that signs the receiver's certificate, set by deployReceiver.
+	caPEM []byte
+}
+
+// newHarness checks the tools every leg needs and gives the test a context that ends after within
+// or on a signal. A signal would otherwise kill the binary before t.Cleanup deletes the cluster: a
+// test runner may send SIGTERM to stop a run early, and SIGPIPE arrives once the killed go command
+// stops reading our output. Cancelling instead fails the test and cleans up.
+func newHarness(t *testing.T, within time.Duration) *harness {
+	t.Helper()
+	for _, tool := range []string{"docker", "kind", "kubectl", "helm", "go"} {
+		if _, err := exec.LookPath(tool); err != nil {
+			t.Fatalf("%s is not on the PATH", tool)
+		}
+	}
+	moduleRoot, err := filepath.Abs("../..")
+	if err != nil {
+		t.Fatal(err)
+	}
+	chart := env("E2E_CHART", filepath.Join(moduleRoot, "..", "helm-charts", "costfluent-k8s-agent"))
+	if _, err := os.Stat(filepath.Join(chart, "Chart.yaml")); err != nil {
+		t.Fatalf("no chart at %s (set E2E_CHART): %v", chart, err)
+	}
+	signalled, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM, syscall.SIGPIPE)
+	ctx, cancel := context.WithTimeout(signalled, within)
+	// Registered first, so they run after every other cleanup, which therefore cannot use h.ctx.
+	t.Cleanup(stop)
+	t.Cleanup(cancel)
+	dir := t.TempDir()
+	return &harness{t: t, ctx: ctx, kubeconfig: filepath.Join(dir, "kubeconfig"), dir: dir,
+		moduleRoot: moduleRoot, chart: chart, storageClass: "standard"}
 }
 
 func (h *harness) run(name string, args ...string) string {
@@ -118,97 +156,208 @@ func (h *harness) apply(manifest string) {
 	}
 }
 
-func TestKindSmoke(t *testing.T) {
-	for _, tool := range []string{"docker", "kind", "kubectl", "helm", "go"} {
-		if _, err := exec.LookPath(tool); err != nil {
-			t.Fatalf("%s is not on the PATH", tool)
-		}
-	}
-	moduleRoot, err := filepath.Abs("../..")
-	if err != nil {
-		t.Fatal(err)
-	}
-	chart := env("E2E_CHART", filepath.Join(moduleRoot, "..", "helm-charts", "costfluent-k8s-agent"))
-	if _, err := os.Stat(filepath.Join(chart, "Chart.yaml")); err != nil {
-		t.Fatalf("no chart at %s (set E2E_CHART): %v", chart, err)
-	}
+// keep reports whether E2E_KEEP_CLUSTER asks to leave the cluster running for a look.
+func keep() bool { return os.Getenv("E2E_KEEP_CLUSTER") != "" }
 
-	// A signal would otherwise kill the binary before t.Cleanup deletes the cluster: a test runner
-	// may send SIGTERM to stop a run early, and SIGPIPE arrives once the
-	// killed go command stops reading our output. Cancelling instead fails the test and cleans up.
-	signalled, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM, syscall.SIGPIPE)
-	defer stop()
-	ctx, cancel := context.WithTimeout(signalled, 14*time.Minute)
-	defer cancel()
-	dir := t.TempDir()
-	h := &harness{t: t, ctx: ctx, kubeconfig: filepath.Join(dir, "kubeconfig")}
-	// Per run, so concurrent runs on one Docker daemon do not collide.
-	cluster := env("KIND_CLUSTER_NAME", fmt.Sprintf("costfluent-e2e-%d", os.Getpid()))
-
-	t.Cleanup(func() {
-		if os.Getenv("E2E_KEEP_CLUSTER") != "" {
-			t.Logf("keeping kind cluster %s (KUBECONFIG=%s)", cluster, h.kubeconfig)
+// kindCluster creates a kind cluster named prefix and the process ID, so concurrent runs on one
+// Docker daemon do not collide, from config when it is not empty, and deletes it when the test
+// ends. KIND_CLUSTER_NAME overrides the name.
+func (h *harness) kindCluster(prefix, config string) string {
+	h.t.Helper()
+	cluster := env("KIND_CLUSTER_NAME", fmt.Sprintf("%s-%d", prefix, os.Getpid()))
+	h.t.Cleanup(func() {
+		if keep() {
+			h.t.Logf("keeping kind cluster %s (KUBECONFIG=%s)", cluster, h.kubeconfig)
 			return
 		}
 		out, err := exec.Command("kind", "delete", "cluster", "--name", cluster).CombinedOutput()
 		if err != nil {
-			t.Logf("kind delete cluster: %v\n%s", err, out)
+			h.t.Logf("kind delete cluster: %v\n%s", err, out)
 		}
 	})
-	h.run("kind", "create", "cluster", "--name", cluster, "--image", env("KIND_NODE_IMAGE", defaultNodeImage),
-		"--kubeconfig", h.kubeconfig, "--wait", "180s")
-	h.assertVolumeClaimGuard(chart)
+	args := []string{"create", "cluster", "--name", cluster, "--image", env("KIND_NODE_IMAGE", defaultNodeImage),
+		"--kubeconfig", h.kubeconfig, "--wait", "180s"}
+	if config != "" {
+		file := filepath.Join(h.dir, "kind.yaml")
+		if err := os.WriteFile(file, []byte(config), 0o644); err != nil {
+			h.t.Fatal(err)
+		}
+		args = append(args, "--config", file)
+	}
+	h.run("kind", args...)
+	return cluster
+}
 
-	receiverDir := filepath.Join(dir, "receiver")
-	build := exec.CommandContext(ctx, "go", "build", "-trimpath", "-o", filepath.Join(receiverDir, "receiver"), "./test/e2e/receiver")
-	build.Dir = moduleRoot
-	build.Env = append(os.Environ(), "CGO_ENABLED=0", "GOOS=linux", "GOARCH="+runtime.GOARCH)
-	if out, err := build.CombinedOutput(); err != nil {
-		t.Fatalf("build receiver: %v\n%s", err, out)
+// buildImages builds the agent image from the module and an image for each named helper under
+// test/e2e, from its static binary built on the host and its own Dockerfile.
+func (h *harness) buildImages(helpers ...string) {
+	h.t.Helper()
+	for _, name := range helpers {
+		dir := filepath.Join(h.dir, name)
+		build := exec.CommandContext(h.ctx, "go", "build", "-trimpath", "-o", filepath.Join(dir, name), "./test/e2e/"+name)
+		build.Dir = h.moduleRoot
+		build.Env = append(os.Environ(), "CGO_ENABLED=0", "GOOS=linux", "GOARCH="+runtime.GOARCH)
+		if out, err := build.CombinedOutput(); err != nil {
+			h.t.Fatalf("build %s: %v\n%s", name, err, out)
+		}
+		dockerfile, err := os.ReadFile(filepath.Join(h.moduleRoot, "test", "e2e", name, "Dockerfile"))
+		if err != nil {
+			h.t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "Dockerfile"), dockerfile, 0o644); err != nil {
+			h.t.Fatal(err)
+		}
+		h.run("docker", "build", "-q", "-t", "costfluent-e2e/"+name+":"+imageTag, dir)
 	}
-	dockerfile, err := os.ReadFile(filepath.Join(moduleRoot, "test", "e2e", "receiver", "Dockerfile"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(receiverDir, "Dockerfile"), dockerfile, 0o644); err != nil {
-		t.Fatal(err)
-	}
-	h.run("docker", "build", "-q", "-t", receiverImage+":"+imageTag, receiverDir)
-	h.run("docker", "build", "-q", "-t", agentImage+":"+imageTag, "--build-arg", "VERSION="+agentVersion, moduleRoot)
-	caPEM, certPEM, keyPEM := testCertificates(t)
-	tlsTag := tlsImageTag(cluster)
-	h.trustInImage(caPEM, dir, tlsTag)
-	h.run("kind", "load", "docker-image", "--name", cluster, receiverImage+":"+imageTag, agentImage+":"+tlsTag)
+	h.run("docker", "build", "-q", "-t", agentImage+":"+imageTag, "--build-arg", "VERSION="+agentVersion, h.moduleRoot)
+}
 
-	h.apply(workloads(certPEM, keyPEM))
-	h.run("kubectl", "-n", "e2e", "rollout", "status", "deployment/receiver", "--timeout=120s")
+// deployReceiver deploys the receiver behind a certificate of a fresh CA, and fillers pods beside
+// it, and waits for both.
+func (h *harness) deployReceiver(fillers int) {
+	h.t.Helper()
+	caPEM, certPEM, keyPEM := testCertificates(h.t)
+	h.caPEM = caPEM
+	h.apply(workloads(certPEM, keyPEM, fillers))
+	h.run("kubectl", "-n", "e2e", "rollout", "status", "deployment/receiver", "--timeout=180s")
 	h.run("kubectl", "-n", "e2e-filler", "rollout", "status", "deployment/filler", "--timeout=180s")
+}
 
-	installed := time.Now()
-	h.run("helm", "install", release, chart, "--namespace", "costfluent", "--create-namespace",
-		"--set", "agent.token="+token,
-		"--set", "agent.apiEndpoint="+apiEndpoint,
-		"--set", "agent.pollingInterval=5",
-		// kind kubelets serve self-signed certificates.
-		"--set", "agent.disableKubeTLSverify=true",
-		"--set", "image.repository="+agentImage,
-		"--set", "image.tag="+tlsTag,
-		"--set", "image.pullPolicy=Never")
-	t.Cleanup(func() {
-		if t.Failed() {
-			out, _ := h.try("kubectl", "-n", "costfluent", "describe", "pods")
-			t.Logf("agent pods:\n%s", out)
-			out, _ = h.try("kubectl", "-n", "costfluent", "logs", "statefulset/"+release+"-costfluent-k8s-agent", "--tail=100")
-			t.Logf("agent logs:\n%s", out)
+// installAgent installs the chart as the console's command does, with helm upgrade --install
+// --wait, plus values, and returns when the install began. The agent trusts the receiver's CA
+// through agent.reportCABundle. Once installed, it holds the release to the split of the agent's
+// two accounts.
+func (h *harness) installAgent(values ...string) time.Time {
+	h.t.Helper()
+	h.apply(fmt.Sprintf(`apiVersion: v1
+kind: Namespace
+metadata:
+  name: costfluent
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: %s
+  namespace: costfluent
+data:
+  ca.crt: %q
+`, receiverCA, h.caPEM))
+	h.t.Cleanup(func() {
+		if !h.t.Failed() {
+			return
+		}
+		// Cleanups run after the context's own cleanup cancelled it, so a command on h.ctx never
+		// starts here: the diagnostics get a context of their own.
+		diagCtx, cancel := context.WithTimeout(context.Background(), time.Minute)
+		defer cancel()
+		diag := &harness{t: h.t, ctx: diagCtx, kubeconfig: h.kubeconfig}
+		for _, c := range []struct {
+			title string
+			args  []string
+		}{
+			{"agent pods", []string{"-n", "costfluent", "describe", "pods"}},
+			{"agent logs", []string{"-n", "costfluent", "logs", "statefulset/" + agentFullname, "--tail=100"}},
+			// Conditions and allocated resources tell a starved node from an agent that never reported.
+			{"nodes", []string{"describe", "nodes"}},
+		} {
+			out, err := diag.try("kubectl", c.args...)
+			if err != nil {
+				out += fmt.Sprintf("\n(kubectl %s: %v)", strings.Join(c.args, " "), err)
+			}
+			h.t.Logf("%s:\n%s", c.title, out)
 		}
 	})
+	installed := time.Now()
+	args := []string{"upgrade", release, h.chart, "--install", "--namespace", "costfluent", "--create-namespace",
+		"--wait", "--timeout", "5m",
+		"--set", "agent.token=" + token,
+		"--set", "agent.apiEndpoint=" + apiEndpoint,
+		"--set", fmt.Sprintf("agent.pollingInterval=%d", pollEvery),
+		"--set", "agent.reportCABundle.configMap=" + receiverCA,
+		"--set", "image.repository=" + agentImage,
+		"--set", "image.tag=" + imageTag,
+		"--set", "image.pullPolicy=Never"}
+	for _, v := range values {
+		args = append(args, "--set", v)
+	}
+	h.run("helm", args...)
+	h.assertKubeletAccount()
+	return installed
+}
 
+// assertKubeletAccount holds the chart to sending kubelets only the metrics account's token: the
+// agent's own account, which reads every node and pod, may not get nodes/metrics, and the kubelet
+// account the agent mints tokens for may. A report with usage after this proves the minted token
+// works against a real kubelet.
+func (h *harness) assertKubeletAccount() {
+	h.t.Helper()
+	agent := "system:serviceaccount:costfluent:" + agentFullname
+	for _, c := range []struct {
+		as   string
+		want string
+	}{{agent, "no"}, {agent + "-kubelet", "yes"}} {
+		// can-i exits 1 on "no", so the answer is read from its output rather than its status.
+		out, _ := h.try("kubectl", "auth", "can-i", "get", "nodes", "--subresource=metrics", "--as="+c.as)
+		lines := strings.Split(strings.TrimSpace(out), "\n")
+		if answer := strings.Fields(lines[len(lines)-1]); len(answer) == 0 || answer[0] != c.want {
+			h.t.Fatalf("kubectl auth can-i get nodes/metrics --as=%s answered %q, want %q", c.as, out, c.want)
+		}
+	}
+}
+
+func TestKindSmoke(t *testing.T) {
+	h := newHarness(t, 14*time.Minute)
+	cluster := h.kindCluster("costfluent-e2e", "")
+	h.assertVolumeClaimGuard()
+	h.buildImages("receiver")
+	h.assertImageBundle()
+	h.run("kind", "load", "docker-image", "--name", cluster, receiverImage+":"+imageTag, agentImage+":"+imageTag)
+	h.deployReceiver(fillerPods)
+
+	// kind kubelets serve self-signed certificates.
+	installed := h.installAgent("agent.disableKubeTLSverify=true")
 	report := h.awaitReport(installed)
 	t.Logf("report from %s after %s: window %s to %s, %d nodes, %d pods", apiEndpoint,
 		time.Since(installed).Round(time.Second), report.WindowStart.Format(time.RFC3339), report.WindowEnd.Format(time.RFC3339),
 		len(report.Nodes), len(report.Pods))
 	logAgentFootprint(t, report)
+
+	h.assertShutdownReport(report)
 }
+
+// assertShutdownReport stops the agent the way Kubernetes does, by uninstalling the release so the
+// kubelet sends SIGTERM and waits the chart's grace period, and holds the agent to closing and
+// sending the window that is open then. The uninstall leaves no pod to start again, so a report
+// after the stop can only come from the shutdown.
+func (h *harness) assertShutdownReport(first v1.Report) {
+	h.t.Helper()
+	// At least two polls into the open window, so it holds samples to send.
+	h.sleepUntil(first.WindowEnd.Add(3 * pollEvery * time.Second))
+	if now := time.Now(); nextHour(now).Sub(now) < hourMargin {
+		h.sleepUntil(nextHour(now).Add(3 * pollEvery * time.Second))
+	}
+	// Against a receiver that answers at once the whole shutdown fits in any grace period, so only a
+	// send slower than a too-short one tells the chart's period from one the kubelet kills the drain in.
+	h.postReceiver("delay")
+	stopped := time.Now()
+	h.run("helm", "uninstall", release, "--namespace", "costfluent", "--wait")
+	report := h.awaitReportAfter(first, stopped, shutdownWithin)
+	h.t.Logf("shutdown report %s after the uninstall began: window %s to %s, %d pods",
+		time.Since(stopped).Round(time.Second), report.WindowStart.Format(time.RFC3339), report.WindowEnd.Format(time.RFC3339Nano),
+		len(report.Pods))
+}
+
+// sleepUntil waits until t, failing the test when its context ends first.
+func (h *harness) sleepUntil(t time.Time) {
+	h.t.Helper()
+	select {
+	case <-time.After(time.Until(t)):
+	case <-h.ctx.Done():
+		h.t.Fatalf("waiting until %s: %v", t.Format(time.RFC3339), h.ctx.Err())
+	}
+}
+
+func nextHour(t time.Time) time.Time { return t.Truncate(time.Hour).Add(time.Hour) }
 
 // testCertificates returns a CA and a server certificate it signs for the receiver's Service names,
 // as PEM. The hour of slack before now covers a node clock slightly behind the host's.
@@ -262,20 +411,20 @@ func testCertificates(t *testing.T) (caPEM, certPEM, keyPEM []byte) {
 		pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: keyDER})
 }
 
-// trustInImage checks the CA bundle the agent image ships and commits a copy of the image, tagged
-// tag, whose bundle also holds caPEM. The CA is appended to the shipped file rather than
-// added beside it or pointed at with SSL_CERT_FILE, so the agent still trusts only what the image
-// carries, and a bundle that is missing, moved or empty fails here.
-func (h *harness) trustInImage(caPEM []byte, dir, tag string) {
+// assertImageBundle holds the agent image to shipping the CA bundle it verifies the API with. The
+// agent adds agent.reportCABundle's certificates to that bundle rather than replacing it, so an image
+// whose bundle is missing, moved or emptied would still trust this test's receiver while failing
+// every customer against the real API: only this check sees it.
+func (h *harness) assertImageBundle() {
 	h.t.Helper()
 	container := strings.TrimSpace(h.run("docker", "create", agentImage+":"+imageTag))
-	h.t.Cleanup(func() {
+	defer func() {
 		// -v also removes the anonymous volume the image's VOLUME gives the container.
 		if out, err := exec.Command("docker", "rm", "-v", container).CombinedOutput(); err != nil {
 			h.t.Logf("docker rm: %v\n%s", err, out)
 		}
-	})
-	file := filepath.Join(dir, "ca-certificates.crt")
+	}()
+	file := filepath.Join(h.dir, "ca-certificates.crt")
 	if out, err := h.try("docker", "cp", container+":"+bundlePath, file); err != nil {
 		h.t.Fatalf("the agent image ships no CA bundle at %s: %v\n%s", bundlePath, err, out)
 	}
@@ -286,26 +435,6 @@ func (h *harness) trustInImage(caPEM []byte, dir, tag string) {
 	if n := countCertificates(bundle); n < minBundleCertificates {
 		h.t.Fatalf("the agent image's CA bundle holds %d certificates, fewer than %d", n, minBundleCertificates)
 	}
-	if len(bundle) > 0 && !bytes.HasSuffix(bundle, []byte("\n")) {
-		bundle = append(bundle, '\n')
-	}
-	bundle = append(bundle, caPEM...)
-	if err := os.WriteFile(file, bundle, 0o644); err != nil {
-		h.t.Fatal(err)
-	}
-	// docker cp keeps the file's mode, and the image runs as user 1000, so the file must be
-	// world-readable. It already exists from the copy out, which set its mode, and WriteFile's
-	// mode applies only to a file it creates, so this is the one line that sets it.
-	if err := os.Chmod(file, 0o644); err != nil {
-		h.t.Fatal(err)
-	}
-	h.run("docker", "cp", file, container+":"+bundlePath)
-	h.run("docker", "commit", container, agentImage+":"+tag)
-	h.t.Cleanup(func() {
-		if out, err := exec.Command("docker", "rmi", agentImage+":"+tag).CombinedOutput(); err != nil {
-			h.t.Logf("docker rmi: %v\n%s", err, out)
-		}
-	})
 }
 
 // countCertificates counts the PEM certificates in bundle that Go can parse, the ones it would
@@ -335,10 +464,10 @@ const defaultClassAnnotation = "storageclass.kubernetes.io/is-default-class"
 // in the cluster can provision. Such a claim stays Pending, so the pod is never scheduled and the
 // agent never starts to log why. Only a render against a cluster sees its StorageClasses, so this
 // runs here and not in check-helm-chart.sh, whose offline renders the guard must let through.
-func (h *harness) assertVolumeClaimGuard(chart string) {
+func (h *harness) assertVolumeClaimGuard() {
 	h.t.Helper()
 	render := func(args ...string) (string, error) {
-		return h.try("helm", append([]string{"template", release, chart, "--namespace", "costfluent",
+		return h.try("helm", append([]string{"template", release, h.chart, "--namespace", "costfluent",
 			"--dry-run=server", "--set", "agent.token=" + token}, args...)...)
 	}
 	refused := func(want string, args ...string) {
@@ -379,26 +508,13 @@ func (h *harness) awaitReport(since time.Time) v1.Report {
 	var last string
 	for time.Since(since) < reportWithin {
 		time.Sleep(5 * time.Second)
-		if err := h.ctx.Err(); err != nil {
-			h.t.Fatalf("waiting for a report: %v", err)
-		}
-		raw, err := h.try("kubectl", "get", "--raw", "/api/v1/namespaces/e2e/services/receiver:8080/proxy/reports")
-		if err != nil {
-			last = raw
+		got, err := h.receiverReports()
+		if err != "" {
+			last = err
 			continue
 		}
-		var got struct {
-			Reports  []json.RawMessage `json:"reports"`
-			Refusals []string          `json:"refusals"`
-		}
-		if err := json.Unmarshal([]byte(raw), &got); err != nil {
-			h.t.Fatalf("receiver answered %q: %v", raw, err)
-		}
-		if len(got.Refusals) > 0 {
-			h.t.Fatalf("the receiver refused the agent's requests: %v", got.Refusals)
-		}
 		for _, body := range got.Reports {
-			report, problem := check(body)
+			report, problem := check(body, h.storageClass)
 			if problem == "" {
 				return report
 			}
@@ -409,7 +525,99 @@ func (h *harness) awaitReport(since time.Time) v1.Report {
 	return v1.Report{}
 }
 
-func check(body json.RawMessage) (v1.Report, string) {
+// awaitReportAfter polls the receiver until it holds the report of the window the agent's shutdown
+// closed: from first's agent instance, ending at or after stopped and before the clock would have
+// closed it, and starting where an earlier report of that instance ended, so no usage between the
+// two is lost. It fails the test when no such report arrives within within of now.
+func (h *harness) awaitReportAfter(first v1.Report, stopped time.Time, within time.Duration) v1.Report {
+	h.t.Helper()
+	deadline := time.Now().Add(within)
+	last := "no report ends after the stop"
+	for time.Now().Before(deadline) {
+		time.Sleep(2 * time.Second)
+		got, err := h.receiverReports()
+		if err != "" {
+			last = err
+			continue
+		}
+		ends := map[time.Time]bool{}
+		var after []v1.Report
+		for _, body := range got.Reports {
+			report, problem := check(body, h.storageClass)
+			switch {
+			case report.AgentInstanceID != first.AgentInstanceID:
+			case problem != "":
+				last = problem
+			case report.WindowEnd.Before(stopped):
+				ends[report.WindowEnd.UTC()] = true
+			default:
+				after = append(after, report)
+			}
+		}
+		for _, report := range after {
+			clockEnd := nextHour(report.WindowStart)
+			switch {
+			case !report.WindowEnd.Before(clockEnd):
+				last = fmt.Sprintf("the window %s to %s ends by the clock, not at the stop at %s",
+					report.WindowStart.Format(time.RFC3339), report.WindowEnd.Format(time.RFC3339Nano), stopped.Format(time.RFC3339Nano))
+			case report.WindowStart.Before(first.WindowEnd) || !ends[report.WindowStart.UTC()]:
+				last = fmt.Sprintf("the shutdown's window starts at %s, where no earlier report of the agent ends",
+					report.WindowStart.Format(time.RFC3339Nano))
+			default:
+				return report
+			}
+		}
+	}
+	h.t.Fatalf("the stopped agent sent no report of its open window within %s of the uninstall; last: %s", within, last)
+	return v1.Report{}
+}
+
+// postReceiver sends an empty POST to the receiver's path through the API server's service proxy.
+func (h *harness) postReceiver(path string) {
+	h.t.Helper()
+	cmd := exec.CommandContext(h.ctx, "kubectl", "create", "--raw", "/api/v1/namespaces/e2e/services/receiver:8080/proxy/"+path, "-f", "-")
+	cmd.Env = append(os.Environ(), "KUBECONFIG="+h.kubeconfig)
+	cmd.Stdin = strings.NewReader("")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		h.t.Fatalf("POST receiver /%s: %v\n%s", path, err, out)
+	}
+}
+
+// received is what the receiver accepted: each report's body and, at the same index, the address
+// of the peer that sent it.
+type received struct {
+	Reports  []json.RawMessage `json:"reports"`
+	Peers    []string          `json:"peers"`
+	Refusals []string          `json:"refusals"`
+}
+
+// receiverReports returns what the receiver accepted, or why it could not be read. It fails the
+// test when the receiver refused any request of the agent's.
+func (h *harness) receiverReports() (received, string) {
+	h.t.Helper()
+	if err := h.ctx.Err(); err != nil {
+		h.t.Fatalf("waiting for a report: %v", err)
+	}
+	raw, err := h.try("kubectl", "get", "--raw", "/api/v1/namespaces/e2e/services/receiver:8080/proxy/reports")
+	if err != nil {
+		return received{}, raw
+	}
+	var got received
+	if err := json.Unmarshal([]byte(raw), &got); err != nil {
+		h.t.Fatalf("receiver answered %q: %v", raw, err)
+	}
+	if len(got.Refusals) > 0 {
+		h.t.Fatalf("the receiver refused the agent's requests: %v", got.Refusals)
+	}
+	if len(got.Peers) != len(got.Reports) {
+		h.t.Fatalf("the receiver holds %d reports and %d peers", len(got.Reports), len(got.Peers))
+	}
+	return got, ""
+}
+
+// decode reads body into api/v1 as the API does, refusing members it does not know, and checks
+// the header every report carries.
+func decode(body json.RawMessage) (v1.Report, string) {
 	var r v1.Report
 	dec := json.NewDecoder(bytes.NewReader(body))
 	dec.DisallowUnknownFields()
@@ -420,8 +628,18 @@ func check(body json.RawMessage) (v1.Report, string) {
 		return r, fmt.Sprintf("header: schema %d, cluster %q, instance %q, agent version %q (built with %q)",
 			r.SchemaVersion, r.ClusterID, r.AgentInstanceID, r.AgentVersion, agentVersion)
 	}
+	return r, ""
+}
+
+// check holds a report to carrying usage: nodes, kube-system pods with CPU and memory, and the
+// agent's own claim, provisioned from storageClass.
+func check(body json.RawMessage, storageClass string) (v1.Report, string) {
+	r, problem := decode(body)
+	if problem != "" {
+		return r, problem
+	}
 	if len(r.Nodes) == 0 {
-		return r, "no nodes"
+		return r, fmt.Sprintf("no nodes; unscraped_nodes %v", r.UnscrapedNodes)
 	}
 	var kubeSystem int
 	var cpu float64
@@ -439,13 +657,45 @@ func check(body json.RawMessage) (v1.Report, string) {
 	if cpu <= 0 {
 		return r, "CPU usage is zero"
 	}
-	return r, checkAgentClaim(r)
+	if problem := checkMemory(r); problem != "" {
+		return r, problem
+	}
+	return r, checkAgentClaim(r, storageClass)
 }
 
-// checkAgentClaim holds the report to the agent's own buffer volume: a Bound volume of kind's
-// standard class serving the StatefulSet's data claim, which the agent's pod mounts.
-func checkAgentClaim(r v1.Report) string {
-	claim := "data-" + release + "-costfluent-k8s-agent-0"
+// checkMemory holds the report to the working set the kubelet measures beside CPU: every container
+// that used CPU carries memory byte-seconds and a peak, and so do a kube-system container and the
+// agent's own. Both figures come from the same /metrics/resource scrape and container key as CPU, so
+// a container with CPU and no memory is a memory sample the parser or aggregator lost, which would
+// otherwise reach the report as a zero working set with no other signal.
+func checkMemory(r v1.Report) string {
+	var kubeSystem, agent bool
+	for _, p := range r.Pods {
+		for _, c := range p.Containers {
+			hasMemory := c.MemoryUsageByteSeconds > 0 && c.MemoryUsagePeakBytes > 0
+			if c.CPUUsageCoreSeconds > 0 && !hasMemory {
+				return fmt.Sprintf("container %s/%s/%s used %g CPU core-seconds but reports memory of %g byte-seconds, peak %d bytes",
+					p.Namespace, p.Name, c.Name, c.CPUUsageCoreSeconds, c.MemoryUsageByteSeconds, c.MemoryUsagePeakBytes)
+			}
+			if hasMemory {
+				kubeSystem = kubeSystem || p.Namespace == "kube-system"
+				agent = agent || p.Namespace == "costfluent"
+			}
+		}
+	}
+	if !kubeSystem {
+		return "no kube-system container reports memory usage"
+	}
+	if !agent {
+		return "the agent's own container reports no memory usage"
+	}
+	return ""
+}
+
+// checkAgentClaim holds the report to the agent's own buffer volume: a Bound volume of storageClass
+// serving the StatefulSet's data claim, which the agent's pod mounts.
+func checkAgentClaim(r v1.Report, storageClass string) string {
+	claim := "data-" + agentFullname + "-0"
 	var volume *v1.Volume
 	for i := range r.Volumes {
 		if r.Volumes[i].ClaimNamespace == "costfluent" && r.Volumes[i].ClaimName == claim {
@@ -455,8 +705,8 @@ func checkAgentClaim(r v1.Report) string {
 	if volume == nil {
 		return fmt.Sprintf("no volume serves the agent's claim %s among %d volumes", claim, len(r.Volumes))
 	}
-	if volume.Phase != "Bound" || volume.StorageClass != "standard" || volume.CapacityBytes <= 0 || volume.ObservedSeconds <= 0 {
-		return fmt.Sprintf("the agent's volume = %+v, want Bound, of class standard, sized and observed", *volume)
+	if volume.Phase != "Bound" || volume.StorageClass != storageClass || volume.CapacityBytes <= 0 || volume.ObservedSeconds <= 0 {
+		return fmt.Sprintf("the agent's volume = %+v, want Bound, of class %s, sized and observed", *volume, storageClass)
 	}
 	for _, p := range r.Pods {
 		if p.Namespace == "costfluent" && slices.Contains(p.Claims, claim) {
@@ -486,7 +736,8 @@ func logAgentFootprint(t *testing.T, r v1.Report) {
 	}
 }
 
-func workloads(certPEM, keyPEM []byte) string {
+// workloads is the receiver behind certPEM and keyPEM, and fillers pods of a filler Deployment.
+func workloads(certPEM, keyPEM []byte, fillers int) string {
 	return fmt.Sprintf(`apiVersion: v1
 kind: Namespace
 metadata:
@@ -550,7 +801,7 @@ spec:
     - {name: http, port: 8080, targetPort: 8080}
     - {name: https, port: 8443, targetPort: 8443}
 ---
-# Brings the cluster to about 60 pods, the size the chart README's sizing is measured at.
+# TestKindSmoke brings the cluster to about 60 pods, the size the chart README's sizing is measured at.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -572,6 +823,6 @@ spec:
             - {name: RECEIVER_TOKEN, value: unused}
           resources:
             requests: {cpu: 1m, memory: 8Mi}
-`, receiverImage+":"+imageTag, token, fillerPods,
+`, receiverImage+":"+imageTag, token, fillers,
 		base64.StdEncoding.EncodeToString(certPEM), base64.StdEncoding.EncodeToString(keyPEM))
 }

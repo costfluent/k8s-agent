@@ -2,6 +2,7 @@ package collector
 
 import (
 	"fmt"
+	"maps"
 	"math"
 	"os"
 	"path/filepath"
@@ -314,24 +315,23 @@ func TestAggregator_SnapshotOfAnotherClusterIsDiscarded(t *testing.T) {
 	}
 }
 
-// Every node of a window can go unscraped while storage is still read, so a saved window can hold
-// volumes and no node. The aggregator never reports a window without a node, so such a window is
-// neither resumed nor returned.
-func TestAggregator_SnapshotWithNoNodesRestoresNothing(t *testing.T) {
+// A saved window keeps, per node never scraped in it, the last reason, so a node scraped after a
+// restart is not counted and one still failing keeps its reason.
+func TestAggregator_SnapshotRoundTripKeepsTheUnscrapedReasons(t *testing.T) {
 	pvc := v1.Volume{Name: "pvc-1", CapacityBytes: 1 << 30, Phase: "Bound", ClaimNamespace: "shop", ClaimName: "data-web-0"}
-	observe := func(a *Aggregator, at time.Time, scraped bool) []v1.Report {
-		obs := obsAt(at, []string{"n1"}, []PodInfo{webPod("n1")}, nil)
+	observe := func(a *Aggregator, at time.Time, nodes []string, unscraped map[string]string) []v1.Report {
+		obs := obsAt(at, nodes, []PodInfo{webPod("n1")}, nil)
 		obs.Volumes = []v1.Volume{pvc}
-		if !scraped {
-			obs.Unscraped = map[string]bool{"n1": true}
-		}
+		obs.Unscraped = unscraped
 		return a.Observe(obs)
 	}
+	all := []string{"n1", "n2", "n3"}
+	allFail := map[string]string{"n1": v1.UnscrapedTLS, "n2": v1.UnscrapedTLS, "n3": v1.UnscrapedUnreachable}
 	save := func(t *testing.T) string {
 		path := filepath.Join(t.TempDir(), "window.json")
 		a := NewAggregator("c", "v", "id", 60*time.Second, t0)
-		observe(a, t0, false)
-		observe(a, t0.Add(time.Minute), false)
+		observe(a, t0, all, allFail)
+		observe(a, t0.Add(time.Minute), all, allFail)
 		if err := a.SaveSnapshot(path); err != nil {
 			t.Fatal(err)
 		}
@@ -340,20 +340,121 @@ func TestAggregator_SnapshotWithNoNodesRestoresNothing(t *testing.T) {
 
 	t.Run("inside the window", func(t *testing.T) {
 		now := t0.Add(90 * time.Second)
-		b := restoreDiscards(t, "c", save(t), now)
-		observe(b, now, true)
-		closed := observe(b, now.Add(FirstWindow), true)
-		if len(closed) != 1 || !closed[0].WindowStart.Equal(now) {
-			t.Fatalf("closed = %+v, want one window from %s", closed, now)
+		b := NewAggregator("c", "v", "id", 60*time.Second, now)
+		if closed, err := b.RestoreSnapshot(save(t), now); err != nil || closed != nil {
+			t.Fatalf("restore = %+v %v, want the window resumed", closed, err)
 		}
-		if v := closed[0].Volumes; len(v) != 1 || !near(v[0].ObservedSeconds, FirstWindow.Seconds()) {
-			t.Fatalf("volumes = %+v, want only the %v observed after the restart", v, FirstWindow)
+		if start, _ := b.Window(); !start.Equal(t0) {
+			t.Fatalf("window starts %s, want the saved %s", start, t0)
+		}
+		// n3 leaves the cluster after the restart, so only the snapshot holds its reason.
+		observe(b, now, []string{"n1", "n2"}, nil)
+		closed := observe(b, t0.Add(FirstWindow), []string{"n1", "n2"}, map[string]string{"n2": v1.UnscrapedOther})
+		if len(closed) != 1 {
+			t.Fatalf("closed %d windows, want 1", len(closed))
+		}
+		if want := map[string]int{v1.UnscrapedOther: 1, v1.UnscrapedUnreachable: 1}; !maps.Equal(closed[0].UnscrapedNodes, want) {
+			t.Fatalf("unscraped = %v, want %v: n1 scraped after the restart, n2 failing for another reason, n3 kept from the snapshot", closed[0].UnscrapedNodes, want)
+		}
+		if n := closed[0].Nodes; len(n) != 1 || n[0].Name != "n1" {
+			t.Fatalf("nodes = %+v, want n1 alone", n)
 		}
 	})
 
 	t.Run("after the window closed", func(t *testing.T) {
-		restoreDiscards(t, "c", save(t), t0.Add(3*time.Hour))
+		later := t0.Add(3 * time.Hour)
+		b := NewAggregator("c", "v2", "id", 60*time.Second, later)
+		closed, err := b.RestoreSnapshot(save(t), later)
+		if err != nil || closed == nil {
+			t.Fatalf("restore = %+v %v, want the closed window returned", closed, err)
+		}
+		if want := map[string]int{v1.UnscrapedTLS: 2, v1.UnscrapedUnreachable: 1}; !maps.Equal(closed.UnscrapedNodes, want) || len(closed.Nodes) != 0 {
+			t.Fatalf("restored = nodes %+v, unscraped %v; want no node and %v", closed.Nodes, closed.UnscrapedNodes, want)
+		}
 	})
+}
+
+// A snapshot written before the agent counted unscraped nodes has no reasons; a window it holds
+// still goes out with the field present.
+func TestAggregator_SnapshotWithoutReasonsSendsAnEmptyCount(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "window.json")
+	a := NewAggregator("c", "v", "id", 60*time.Second, t0)
+	a.Observe(obsAt(t0, []string{"n1"}, nil, nil))
+	a.Observe(obsAt(t0.Add(time.Minute), []string{"n1"}, nil, nil))
+	r, _ := a.report(a.end)
+	r.UnscrapedNodes = nil
+	if err := writeSnapshot(path, a.lastSample, r, nil); err != nil {
+		t.Fatal(err)
+	}
+	later := t0.Add(3 * time.Hour)
+	closed, err := NewAggregator("c", "v", "id", 60*time.Second, later).RestoreSnapshot(path, later)
+	if err != nil || closed == nil || closed.UnscrapedNodes == nil || len(closed.UnscrapedNodes) != 0 {
+		t.Fatalf("restored = %+v %v, want unscraped_nodes {}", closed, err)
+	}
+}
+
+func TestAggregator_SendsAWindowWhoseNodesAllFailed(t *testing.T) {
+	nodes := []string{"n1", "n2", "n3"}
+	pods := []PodInfo{webPod("n1"), apiPod("n2")}
+	failing := map[string]string{"n1": v1.UnscrapedTLS, "n2": v1.UnscrapedTLS, "n3": v1.UnscrapedTLS}
+	a := NewAggregator("c", "v", "id", 60*time.Second, t0)
+	var closed []v1.Report
+	for i := 0; i <= 2; i++ {
+		o := obsAt(t0.Add(time.Duration(i)*time.Minute), nodes, pods, nil)
+		o.Unscraped = failing
+		closed = append(closed, a.Observe(o)...)
+	}
+	if len(closed) != 1 {
+		t.Fatalf("closed %d windows, want the first window sent although no node was read", len(closed))
+	}
+	r := closed[0]
+	if len(r.Nodes) != 0 || len(r.Pods) != 0 {
+		t.Errorf("nodes %+v, pods %+v; want none from kubelets that were never read", r.Nodes, r.Pods)
+	}
+	if want := map[string]int{v1.UnscrapedTLS: 3}; !maps.Equal(r.UnscrapedNodes, want) {
+		t.Errorf("unscraped = %v, want %v", r.UnscrapedNodes, want)
+	}
+	if err := r.CheckSize(); err != nil {
+		t.Errorf("the window is held back: %v", err)
+	}
+
+	next := obsAt(t0.Add(3*time.Minute), nodes, pods, nil)
+	a.Observe(next)
+	r, ok := a.Finish(t0.Add(4 * time.Minute))
+	if !ok || len(r.Nodes) != 3 || r.UnscrapedNodes == nil || len(r.UnscrapedNodes) != 0 {
+		t.Fatalf("next window = nodes %d, unscraped %v, sent %v; want every node and unscraped_nodes {}", len(r.Nodes), r.UnscrapedNodes, ok)
+	}
+}
+
+func TestAggregator_CountsOnlyNodesNeverScrapedInTheWindow(t *testing.T) {
+	nodes := []string{"n1", "n2", "n3", "n4"}
+	polls := []map[string]string{
+		{"n2": v1.UnscrapedTLS, "n3": v1.UnscrapedOther, "n4": v1.UnscrapedUnreachable},
+		{"n2": v1.UnscrapedTLS, "n3": v1.UnscrapedOther},
+		{"n2": v1.UnscrapedTLS, "n3": v1.UnscrapedUnreachable},
+		{"n2": v1.UnscrapedTLS, "n3": v1.UnscrapedUnreachable, "n4": v1.UnscrapedUnreachable},
+	}
+	a := NewAggregator("c", "v", "id", 10*time.Second, t0)
+	a.Observe(obsAt(t0, nodes, nil, nil))
+	for i, unscraped := range polls {
+		o := obsAt(t0.Add(time.Duration(i+1)*10*time.Second), nodes, nil, nil)
+		o.Unscraped = unscraped
+		a.Observe(o)
+	}
+	r, ok := a.Finish(t0.Add(40 * time.Second))
+	if !ok {
+		t.Fatal("the window was not sent")
+	}
+	var names []string
+	for _, n := range r.Nodes {
+		names = append(names, n.Name)
+	}
+	if !reflect.DeepEqual(names, []string{"n1", "n4"}) {
+		t.Errorf("nodes = %v, want n1 and n4, which was read for part of the window", names)
+	}
+	if want := map[string]int{v1.UnscrapedTLS: 1, v1.UnscrapedUnreachable: 1}; !maps.Equal(r.UnscrapedNodes, want) {
+		t.Errorf("unscraped = %v, want %v: n3 by its last reason, n4 not at all", r.UnscrapedNodes, want)
+	}
 }
 
 func apiPod(node string) PodInfo {
@@ -374,7 +475,7 @@ func TestAggregator_LeavesAnUnscrapedNodeAndItsPodsOutOfThatInterval(t *testing.
 	for i, failed := range []bool{false, false, true, true, false, false} {
 		o := obsAt(t0.Add(time.Duration(i)*10*time.Second), []string{"n1", "n2"}, pods, both)
 		if failed {
-			o.Usage, o.Unscraped = onlyN1, map[string]bool{"n2": true}
+			o.Usage, o.Unscraped = onlyN1, map[string]string{"n2": v1.UnscrapedOther}
 		}
 		a.Observe(o)
 	}
@@ -404,8 +505,8 @@ func TestAggregator_LeavesAnUnscrapedNodeAndItsPodsOutOfThatInterval(t *testing.
 	}
 }
 
-func TestAggregator_WhenEveryScrapeFailsNothingIsObserved(t *testing.T) {
-	all := map[string]bool{"n1": true, "n2": true}
+func TestAggregator_ANodeScrapedForPartOfTheWindowIsNotUnscraped(t *testing.T) {
+	all := map[string]string{"n1": v1.UnscrapedOther, "n2": v1.UnscrapedOther}
 	usage := map[ContainerKey]ContainerUsage{
 		{"shop", "web-0", "app"}: {CPUCores: 0.8, HasCPU: true, MemoryBytes: 50},
 		{"shop", "api-0", "app"}: {CPUCores: 0.8, HasCPU: true, MemoryBytes: 50},
@@ -418,14 +519,6 @@ func TestAggregator_WhenEveryScrapeFailsNothingIsObserved(t *testing.T) {
 		return o
 	}
 
-	a := NewAggregator("c", "v", "id", 10*time.Second, t0)
-	for i := range 4 {
-		a.Observe(poll(time.Duration(i)*10*time.Second, i > 0))
-	}
-	if r, ok := a.Finish(t0.Add(30 * time.Second)); ok {
-		t.Errorf("a window in which every scrape failed was reported: %+v", r)
-	}
-
 	b := NewAggregator("c", "v", "id", 10*time.Second, t0)
 	for i := range 5 {
 		b.Observe(poll(time.Duration(i)*10*time.Second, i == 1 || i == 2))
@@ -433,6 +526,9 @@ func TestAggregator_WhenEveryScrapeFailsNothingIsObserved(t *testing.T) {
 	r, ok := b.Finish(t0.Add(40 * time.Second))
 	if !ok || len(r.Nodes) != 2 || !near(r.Nodes[0].ObservedSeconds, 20) || !near(r.Nodes[1].ObservedSeconds, 20) {
 		t.Fatalf("after recovery nodes = %+v %v, want the 20 scraped seconds each", r.Nodes, ok)
+	}
+	if r.UnscrapedNodes == nil || len(r.UnscrapedNodes) != 0 {
+		t.Errorf("unscraped = %v, want {}: both nodes were read for part of the window", r.UnscrapedNodes)
 	}
 	for _, p := range r.Pods {
 		if c := p.Containers[0]; !near(c.ObservedSeconds, 20) || !near(c.CPUUsageCoreSeconds, 0.8*20) {

@@ -2,6 +2,7 @@ package reporter
 
 import (
 	"context"
+	"crypto/x509"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -21,7 +22,7 @@ func TestClient_ProxyCarriesReportTraffic(t *testing.T) {
 	proxyURL, _ := url.Parse(proxy.URL)
 	endpoint, _ := url.Parse("http://reports.example.invalid/api/")
 
-	res := NewClient(endpoint, "t", "v", proxyURL).Send(context.Background(), []byte("x"))
+	res := NewClient(endpoint, "t", "v", proxyURL, nil).Send(context.Background(), []byte("x"))
 	if res.Outcome != Accepted || res.ID != "kr_proxy" {
 		t.Fatalf("result = %+v, want accepted through the proxy", res)
 	}
@@ -37,7 +38,7 @@ func TestClient_AcceptedWithoutAReadableBodyHasNoID(t *testing.T) {
 	}))
 	defer srv.Close()
 	u, _ := url.Parse(srv.URL)
-	res := NewClient(u, "t", "v", nil).Send(context.Background(), []byte("x"))
+	res := NewClient(u, "t", "v", nil, nil).Send(context.Background(), []byte("x"))
 	if res.Outcome != Accepted || res.Status != http.StatusOK || res.ID != "" || res.Message != "" {
 		t.Fatalf("result = %+v, want accepted with no id", res)
 	}
@@ -45,7 +46,7 @@ func TestClient_AcceptedWithoutAReadableBodyHasNoID(t *testing.T) {
 
 func TestClient_InvalidEndpointIsRetriedNotPanicked(t *testing.T) {
 	u := &url.URL{Scheme: "http", Host: "bad host"}
-	res := NewClient(u, "t", "v", nil).Send(context.Background(), []byte("x"))
+	res := NewClient(u, "t", "v", nil, nil).Send(context.Background(), []byte("x"))
 	if res.Outcome != Retry || !strings.HasPrefix(res.Message, "building request:") {
 		t.Fatalf("result = %+v", res)
 	}
@@ -58,7 +59,7 @@ func TestClient_CancelledContextIsRetried(t *testing.T) {
 	u, _ := url.Parse(srv.URL)
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	res := NewClient(u, "t", "v", nil).Send(ctx, []byte("x"))
+	res := NewClient(u, "t", "v", nil, nil).Send(ctx, []byte("x"))
 	if res.Outcome != Retry || !strings.Contains(res.Message, "context canceled") {
 		t.Fatalf("result = %+v, want a retry naming the cancellation", res)
 	}
@@ -90,7 +91,7 @@ func TestClient_ErrorMessages(t *testing.T) {
 			}))
 			defer srv.Close()
 			u, _ := url.Parse(srv.URL)
-			res := NewClient(u, "t", "v", nil).Send(context.Background(), []byte("x"))
+			res := NewClient(u, "t", "v", nil, nil).Send(context.Background(), []byte("x"))
 			if res.Outcome != Rejected || res.Message != tc.want {
 				t.Fatalf("result = %+v, want message %q", res, tc.want)
 			}
@@ -121,7 +122,7 @@ func TestClient_RefusalNamesTheRefusedFields(t *testing.T) {
 			}))
 			defer srv.Close()
 			u, _ := url.Parse(srv.URL)
-			res := NewClient(u, "t", "v", nil).Send(context.Background(), []byte("x"))
+			res := NewClient(u, "t", "v", nil, nil).Send(context.Background(), []byte("x"))
 			if res.Outcome != Rejected || res.Message != tc.message {
 				t.Fatalf("result = %+v, want message %q", res, tc.message)
 			}
@@ -141,7 +142,7 @@ func TestAdvice_NamesTheNextStepPerStatus(t *testing.T) {
 		http.StatusUnauthorized:          "the token is not valid",
 		http.StatusForbidden:             "the token is not this cluster's token",
 		http.StatusConflict:              "run one agent per cluster",
-		http.StatusGone:                  "add it again under Kubernetes, Clusters",
+		http.StatusGone:                  "add it again with Add cluster on the Kubernetes page",
 		http.StatusBadRequest:            "upgrade the agent",
 		http.StatusRequestEntityTooLarge: "larger than the API accepts; it is dropped",
 		http.StatusTooManyRequests:       "retrying with backoff",
@@ -151,5 +152,31 @@ func TestAdvice_NamesTheNextStepPerStatus(t *testing.T) {
 		if got := Advice(Result{Status: status}); !strings.Contains(got, want) {
 			t.Errorf("Advice(%d) = %q, want it to contain %q", status, got, want)
 		}
+	}
+}
+
+// A TLS-inspecting proxy re-signs the API's certificate with its own CA, which only the pool the
+// agent was configured with trusts.
+func TestClient_TrustsTheReportCAFile(t *testing.T) {
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusAccepted)
+		_, _ = w.Write([]byte(`{"id":"kr_ca","clusterId":"c","status":"accepted"}`))
+	}))
+	defer srv.Close()
+	u, _ := url.Parse(srv.URL)
+
+	res := NewClient(u, "t", "v", nil, nil).Send(context.Background(), []byte("x"))
+	if res.Outcome != Retry || !strings.Contains(res.Message, "certificate") {
+		t.Fatalf("without the CA: %+v, want a certificate failure kept for retry", res)
+	}
+
+	pool := x509.NewCertPool()
+	pool.AddCert(srv.Certificate())
+	res = NewClient(u, "t", "v", nil, pool).Send(context.Background(), []byte("x"))
+	if res.Outcome != Accepted || res.ID != "kr_ca" {
+		t.Fatalf("with the CA: %+v, want accepted", res)
+	}
+	if _, me := NewClient(u, "t", "v", nil, pool).Me(context.Background()); strings.Contains(me.Message, "certificate") {
+		t.Fatalf("GET /v1/me with the CA: %+v, want the same trust as reports", me)
 	}
 }

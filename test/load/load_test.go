@@ -19,6 +19,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"path/filepath"
 	"runtime"
 	"runtime/debug"
 	"runtime/metrics"
@@ -30,7 +31,9 @@ import (
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"go.uber.org/zap"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/client-go/rest"
+	"sigs.k8s.io/yaml"
 
 	v1 "github.com/costfluent/k8s-agent/api/v1"
 	"github.com/costfluent/k8s-agent/internal/collector"
@@ -40,15 +43,10 @@ import (
 	"github.com/costfluent/k8s-agent/internal/storage"
 )
 
-// The budgets. Peak heap leaves the Go runtime's own overhead room under the chart's 256Mi limit.
-// The byte caps are the API's own for one report body.
+// The budgets of the agent's own work, and the response delay of the simulated kubelets.
 const (
-	maxHeapBytes        = 200 << 20
-	chartMemoryLimit    = 256 << 20
 	maxSecondPollGETs   = 50
 	minCreditedShare    = 0.95
-	apiMaxCompressed    = 16 << 20
-	apiMaxDecompressed  = 128 << 20
 	defaultKubeletDelay = 25 * time.Millisecond
 )
 
@@ -121,13 +119,13 @@ type receiver struct {
 }
 
 func (rc *receiver) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	body, err := io.ReadAll(io.LimitReader(r.Body, apiMaxCompressed+1))
+	body, err := io.ReadAll(io.LimitReader(r.Body, v1.MaxCompressedBytes+1))
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 	rc.compressed = len(body)
-	if len(body) > apiMaxCompressed {
+	if len(body) > v1.MaxCompressedBytes {
 		http.Error(w, "compressed body over the cap", http.StatusRequestEntityTooLarge)
 		return
 	}
@@ -136,13 +134,13 @@ func (rc *receiver) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	raw, err := io.ReadAll(io.LimitReader(zr, apiMaxDecompressed+1))
+	raw, err := io.ReadAll(io.LimitReader(zr, v1.MaxDecompressedBytes+1))
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 	rc.decompressed = len(raw)
-	if len(raw) > apiMaxDecompressed {
+	if len(raw) > v1.MaxDecompressedBytes {
 		http.Error(w, "decompressed body over the cap", http.StatusRequestEntityTooLarge)
 		return
 	}
@@ -199,7 +197,45 @@ type pollResult struct {
 	pods      int
 }
 
+// chartMemoryLimit returns the memory limit the chart gives the agent's pod by default:
+// resources.limits.memory in its values.yaml. The chart is LOAD_CHART when set, else the sibling
+// helm-charts checkout.
+func chartMemoryLimit(t *testing.T) int64 {
+	t.Helper()
+	chart := os.Getenv("LOAD_CHART")
+	if chart == "" {
+		chart = filepath.Join("..", "..", "..", "helm-charts", "costfluent-k8s-agent")
+	}
+	path := filepath.Join(chart, "values.yaml")
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("no chart values at %s (set LOAD_CHART): %v", path, err)
+	}
+	var values struct {
+		Resources struct {
+			Limits struct {
+				Memory string `json:"memory"`
+			} `json:"limits"`
+		} `json:"resources"`
+	}
+	if err := yaml.Unmarshal(raw, &values); err != nil {
+		t.Fatalf("parsing %s (set LOAD_CHART): %v", path, err)
+	}
+	if values.Resources.Limits.Memory == "" {
+		t.Fatalf("%s sets no resources.limits.memory (set LOAD_CHART)", path)
+	}
+	limit, err := resource.ParseQuantity(values.Resources.Limits.Memory)
+	if err != nil {
+		t.Fatalf("resources.limits.memory in %s (set LOAD_CHART): %v", path, err)
+	}
+	return limit.Value()
+}
+
 func TestLoad_AgentAtTheAPICaps(t *testing.T) {
+	memoryLimit := chartMemoryLimit(t)
+	// Peak heap may take 25/32 of the limit, 200 MiB of 256Mi, which leaves the Go runtime's own
+	// overhead room under it.
+	maxHeapBytes := uint64(memoryLimit) * 25 / 32
 	latency := defaultKubeletDelay
 	if v := os.Getenv("LOAD_KUBELET_LATENCY"); v != "" {
 		d, err := time.ParseDuration(v)
@@ -224,12 +260,12 @@ func TestLoad_AgentAtTheAPICaps(t *testing.T) {
 	heap := startSampler(baseline)
 
 	// The agent's own configuration with its defaults, as the chart installs it: namespace labels
-	// on, and the soft memory limit from the chart's default 256Mi limit, on top of what the fake
-	// API server and kubelets in this process hold.
+	// on, and the soft memory limit from the chart's default limit, on top of what the fake API
+	// server and kubelets in this process hold.
 	t.Setenv("COSTFLUENT_TOKEN", "cf_org_load")
 	t.Setenv("COSTFLUENT_CLUSTER_ID", "load-cluster")
 	t.Setenv("COSTFLUENT_COLLECT_NAMESPACE_LABELS", "true")
-	t.Setenv("COSTFLUENT_MEMORY_LIMIT", strconv.Itoa(chartMemoryLimit))
+	t.Setenv("COSTFLUENT_MEMORY_LIMIT", strconv.FormatInt(memoryLimit, 10))
 	cfg, err := config.Load()
 	if err != nil {
 		t.Fatal(err)
@@ -318,7 +354,7 @@ func TestLoad_AgentAtTheAPICaps(t *testing.T) {
 	// so its memory is not the agent's: sampling stops before the send.
 	peaks := heap.finish()
 	endpoint, _ := url.Parse(receiverSrv.URL)
-	res := reporter.NewClient(endpoint, "cf_org_load", "load", nil).Send(ctx, entry.Body)
+	res := reporter.NewClient(endpoint, "cf_org_load", "load", nil, nil).Send(ctx, entry.Body)
 	if out := os.Getenv("LOAD_SAMPLE_OUT"); out != "" {
 		if err := os.WriteFile(out, entry.Body, 0o644); err != nil {
 			t.Fatal(err)
@@ -351,7 +387,10 @@ func TestLoad_AgentAtTheAPICaps(t *testing.T) {
 	t.Logf("credited %.0f s of a %.0f s window (%.1f%%); window closed by a poll: %v", credited, wall, 100*credited/wall, windowClosed)
 
 	if peakHeap > maxHeapBytes {
-		t.Errorf("peak heap %.1f MiB, over the %d MiB budget", mib(peakHeap), maxHeapBytes>>20)
+		t.Errorf("peak heap %.1f MiB, over the %.1f MiB budget", mib(peakHeap), mib(maxHeapBytes))
+	}
+	if len(closed.Nodes) != v1.MaxNodes {
+		t.Errorf("report carries %d nodes, want the API's cap of %d", len(closed.Nodes), v1.MaxNodes)
 	}
 	if res.Outcome != reporter.Accepted {
 		t.Errorf("the report was refused: %d %s", res.Status, res.Message)

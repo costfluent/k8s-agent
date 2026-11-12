@@ -1,8 +1,14 @@
-// Command receiver is the stub Costfluent API the kind smoke test points the agent at. It describes
+// Command receiver is the stub Costfluent API the e2e tests point the agent at. It describes
 // RECEIVER_TOKEN on GET /v1/me as the cluster token of kind-e2e the chart asks for, accepts
 // POST /v1/kubernetes/reports only when the body is gzip and the bearer token matches
-// RECEIVER_TOKEN, keeps each accepted body, and serves them back as a JSON array on GET /reports.
-// Anything else it refuses and counts, so the test can tell a wrong request from no request.
+// RECEIVER_TOKEN, keeps each accepted body with the address of the peer that sent it, and serves
+// them back as JSON on GET /reports. Anything else it refuses and counts, so the test can tell a
+// wrong request from no request. The peer is the host of the connection's remote address, which is
+// the report proxy's when the agent reports through one.
+//
+// POST /delay makes every later report wait reportDelay after its body arrives and keeps it only
+// when the agent is still connected then, so an agent killed before its send completes leaves no
+// report behind, however quickly it sent.
 //
 // It always serves plain http on :8080. When RECEIVER_TLS_CERT and RECEIVER_TLS_KEY name a PEM
 // certificate and key, it also serves the same routes over TLS on :8443, and then refuses
@@ -17,17 +23,23 @@ import (
 	"encoding/json"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
-const maxBody = 64 << 20
+const (
+	maxBody     = 64 << 20
+	reportDelay = 3 * time.Second
+)
 
 type store struct {
 	mu       sync.Mutex
 	reports  []json.RawMessage
+	peers    []string
 	refusals []string
 }
 
@@ -53,6 +65,7 @@ func main() {
 	}
 	withTLS := certFile != ""
 	s := &store{}
+	var delayed atomic.Bool
 	plainWhileTLS := func(w http.ResponseWriter, r *http.Request, route string) bool {
 		if withTLS && r.TLS == nil {
 			s.refuse(w, http.StatusBadRequest, "plain http on "+route+" while TLS is configured")
@@ -98,8 +111,24 @@ func main() {
 			s.refuse(w, http.StatusBadRequest, "body is not JSON")
 			return
 		}
+		if delayed.Load() {
+			// Over HTTP/1.1 the server notices a closed connection only once the body has been read
+			// to EOF, so the wait below sees the agent die only after this, whatever the decoder read.
+			_, _ = io.Copy(io.Discard, r.Body)
+			select {
+			case <-time.After(reportDelay):
+			case <-r.Context().Done():
+				log.Printf("dropped a report whose sender disconnected during the delay")
+				return
+			}
+		}
+		peer, _, err := net.SplitHostPort(r.RemoteAddr)
+		if err != nil {
+			peer = r.RemoteAddr
+		}
 		s.mu.Lock()
 		s.reports = append(s.reports, json.RawMessage(bytes.Clone(body)))
+		s.peers = append(s.peers, peer)
 		n := len(s.reports)
 		s.mu.Unlock()
 		log.Printf("accepted report %d (%d bytes)", n, len(body))
@@ -113,8 +142,13 @@ func main() {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(struct {
 			Reports  []json.RawMessage `json:"reports"`
+			Peers    []string          `json:"peers"`
 			Refusals []string          `json:"refusals"`
-		}{s.reports, s.refusals})
+		}{s.reports, s.peers, s.refusals})
+	})
+	mux.HandleFunc("POST /delay", func(w http.ResponseWriter, _ *http.Request) {
+		delayed.Store(true)
+		w.WriteHeader(http.StatusNoContent)
 	})
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
