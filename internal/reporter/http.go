@@ -5,6 +5,8 @@ package reporter
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -69,11 +71,15 @@ type Client struct {
 }
 
 // NewClient builds a client for endpoint. proxy, when set, carries only report traffic; otherwise
-// the standard proxy environment variables apply.
-func NewClient(endpoint *url.URL, token, version string, proxy *url.URL) *Client {
+// the standard proxy environment variables apply. rootCAs, when set, is the only pool the API's
+// certificate is verified against; nil means the system pool.
+func NewClient(endpoint *url.URL, token, version string, proxy *url.URL, rootCAs *x509.CertPool) *Client {
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	if proxy != nil {
 		transport.Proxy = http.ProxyURL(proxy)
+	}
+	if rootCAs != nil {
+		transport.TLSClientConfig = &tls.Config{RootCAs: rootCAs, MinVersion: tls.VersionTLS12}
 	}
 	base := strings.TrimRight(endpoint.String(), "/")
 	return &Client{
@@ -200,13 +206,13 @@ func problemMessage(p v1.Problem, body []byte) string {
 func Advice(res Result) string {
 	switch res.Status {
 	case http.StatusUnauthorized:
-		return "the token is not valid: it may have been revoked, or created by an account that is now disabled or deleted; use Mint token on the cluster in Costfluent, put the new token in agent.token (or the secret in agent.secret), restart the agent, then revoke the old one; buffered reports are kept and sent then"
+		return "the token is not valid: it may have been revoked, or created by an account that is now disabled or deleted; use New token on the cluster in Costfluent, put the new token in agent.token (or the secret in agent.secret), restart the agent, then revoke the old one; buffered reports are kept and sent then"
 	case http.StatusForbidden:
-		return "the token is not this cluster's token: use Mint token on the cluster in Costfluent, put that token in agent.token (or the secret in agent.secret), and restart the agent; buffered reports are kept and sent then"
+		return "the token is not this cluster's token: use New token on the cluster in Costfluent, put that token in agent.token (or the secret in agent.secret), and restart the agent; buffered reports are kept and sent then"
 	case http.StatusConflict:
 		return "another agent instance reports this cluster for an overlapping window: run one agent per cluster, each with its own cluster's token"
 	case http.StatusGone:
-		return "this cluster was deleted in Costfluent: add it again under Kubernetes, Clusters, and install its new token, or uninstall the agent"
+		return "this cluster was deleted in Costfluent: add it again with Add cluster on the Kubernetes page, and install its new token, or uninstall the agent"
 	case http.StatusBadRequest:
 		if res.Outcome == Retry {
 			kept := fmt.Sprintf("the report is kept and retried until the API's clock passes its window_end, for up to %.0f hours", storage.DefaultMaxAge.Hours())

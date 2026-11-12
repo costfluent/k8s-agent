@@ -77,9 +77,10 @@ func (s *Sender) Run(ctx context.Context) {
 	}
 }
 
-// Drain sends buffered reports until the buffer is empty or an attempt fails. A window ending on
-// the hour is held until this agent's spread after it, so agents do not all post at once; the
-// short first window after an install is not, so a new install still reports within minutes.
+// Drain sends buffered reports until the buffer is empty or an attempt fails. A whole clock hour,
+// the window every agent closes at once, is held until this agent's spread after it, so agents do
+// not all post at once. A window a start or a stop cut short is not, even when the hour ends it, so
+// a new install still reports within minutes however close to the hour it starts.
 // force ignores the backoff and the spread, for the shutdown flush; an unauthorized token is
 // never retried.
 func (s *Sender) Drain(ctx context.Context, force bool) {
@@ -106,7 +107,7 @@ func (s *Sender) Drain(ctx context.Context, force bool) {
 		if !ok {
 			return
 		}
-		if !force && entry.WindowEnd.Equal(entry.WindowEnd.Truncate(time.Hour)) && now.Before(entry.WindowEnd.Add(s.spread)) {
+		if !force && wholeClockHour(entry) && now.Before(entry.WindowEnd.Add(s.spread)) {
 			return
 		}
 		metrics.ReportBytes.Observe(float64(len(entry.Body)))
@@ -150,4 +151,8 @@ func (s *Sender) Drain(ctx context.Context, force bool) {
 			return
 		}
 	}
+}
+
+func wholeClockHour(e storage.Entry) bool {
+	return e.WindowStart.Equal(e.WindowStart.Truncate(time.Hour)) && e.WindowEnd.Equal(e.WindowStart.Add(time.Hour))
 }

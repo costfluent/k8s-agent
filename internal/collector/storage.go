@@ -297,7 +297,9 @@ func (s *storage) claimLabelsFor(ctx context.Context) map[string]map[string]stri
 
 // cacheVolume keeps what the agent sends of a persistent volume. Only a cloud disk's handle is
 // kept, and one past the API's cap is left out, so the volume is priced by its class rather than
-// refusing the report.
+// refusing the report. A class past the cap is left out too: unlike storageClassName, the beta
+// annotation is free text, and one over-long string makes the API refuse the whole report,
+// compute included.
 func cacheVolume(pv *corev1.PersistentVolume) *cachedVolume {
 	driver, handle := volumeSource(&pv.Spec.PersistentVolumeSource)
 	if !cloudDiskDrivers[driver] || utf16Len(handle) > v1.MaxVolumeHandleLength {
@@ -306,6 +308,9 @@ func cacheVolume(pv *corev1.PersistentVolume) *cachedVolume {
 	class := pv.Spec.StorageClassName
 	if beta, ok := pv.Annotations[corev1.BetaStorageClassAnnotation]; ok {
 		class = beta
+	}
+	if utf16Len(class) > v1.MaxNameLength {
+		class = ""
 	}
 	c := &cachedVolume{
 		Name:          pv.Name,

@@ -109,6 +109,8 @@ func TestStorage_ReportsEveryVolumeWithItsClassHandleAndClaim(t *testing.T) {
 		persistentVolume("pvc-overlong", "x", corev1.VolumeBound, "db/x", csi("ebs.csi.aws.com", "vol-"+strings.Repeat("h", v1.MaxVolumeHandleLength))),
 		persistentVolume("pvc-nfs", "nfs-csi", corev1.VolumeBound, "db/shared", csi("nfs.csi.k8s.io", "nfs-01.corp.internal#exports/team#pvc-nfs#")),
 		betaClass(persistentVolume("pvc-beta", "", corev1.VolumeBound, "db/old", corev1.PersistentVolumeSource{}), "slow"),
+		betaClass(persistentVolume("pvc-beta-overlong", "", corev1.VolumeBound, "db/older", csi("ebs.csi.aws.com", "vol-0beta")),
+			strings.Repeat("b", v1.MaxNameLength+1)),
 	)
 
 	vols := volumesOf(t, m)
@@ -121,6 +123,8 @@ func TestStorage_ReportsEveryVolumeWithItsClassHandleAndClaim(t *testing.T) {
 		{Name: "pvc-azure", CapacityBytes: tenGiB, StorageClass: "managed-csi", CSIDriver: "disk.csi.azure.com", VolumeHandle: azureHandle, Phase: "Released"},
 		// A volume from before storageClassName names its class in the beta annotation.
 		{Name: "pvc-beta", CapacityBytes: tenGiB, StorageClass: "slow", Phase: "Bound", ClaimNamespace: "db", ClaimName: "old"},
+		// A beta class past the API's cap is left out, so the volume is still sent and its window kept.
+		{Name: "pvc-beta-overlong", CapacityBytes: tenGiB, CSIDriver: "ebs.csi.aws.com", VolumeHandle: "vol-0beta", Phase: "Bound", ClaimNamespace: "db", ClaimName: "older"},
 		{Name: "pvc-ebs", CapacityBytes: tenGiB, StorageClass: "gp3", CSIDriver: "ebs.csi.aws.com", VolumeHandle: ebsHandle, Phase: "Bound", ClaimNamespace: "shop", ClaimName: "data-web-0"},
 		{Name: "pvc-gke", CapacityBytes: tenGiB, StorageClass: "standard-rwo", CSIDriver: "pd.csi.storage.gke.io", VolumeHandle: pdHandle, Phase: "Available"},
 		{Name: "pvc-local", CapacityBytes: tenGiB, StorageClass: "local-path", Phase: "Bound", ClaimNamespace: "db", ClaimName: "data"},
@@ -411,5 +415,42 @@ func TestCachedVolume_CopiesAsTheInformerNeeds(t *testing.T) {
 	list := &cachedVolumeList{Items: []*cachedVolume{v}}
 	if l := list.DeepCopyObject().(*cachedVolumeList); len(l.Items) != 1 || &l.Items[0] == &list.Items[0] || list.GetObjectKind() == nil {
 		t.Fatal("cachedVolumeList.DeepCopyObject must copy the item slice")
+	}
+}
+
+func TestCacheVolume_OverlongBetaClassIsLeftOut(t *testing.T) {
+	const maxNamespaceLength = 63
+	// U+1F600 is one rune of two UTF-16 units, as the API counts a string.
+	twoUnit := "\U0001F600"
+	claimNamespace := strings.Repeat("n", maxNamespaceLength)
+	claimName := strings.Repeat("c", v1.MaxNameLength)
+	for _, tc := range []struct {
+		name, specClass, beta, want string
+	}{
+		{name: "at the cap", beta: strings.Repeat("b", v1.MaxNameLength), want: strings.Repeat("b", v1.MaxNameLength)},
+		{name: "one past the cap", beta: strings.Repeat("b", v1.MaxNameLength+1)},
+		{name: "two-unit runes past the cap", beta: strings.Repeat(twoUnit, 127)},
+		{name: "two-unit runes at the cap", beta: strings.Repeat(twoUnit, 126) + "b", want: strings.Repeat(twoUnit, 126) + "b"},
+		// Kubernetes reads the annotation before storageClassName, so the spec's class is not the volume's.
+		{name: "past the cap over a spec class", specClass: "gp3", beta: strings.Repeat("b", v1.MaxNameLength+1)},
+		{name: "spec class past the cap", specClass: strings.Repeat("s", v1.MaxNameLength+1)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			pv := persistentVolume("pvc-1", tc.specClass, corev1.VolumeBound, claimNamespace+"/"+claimName, csi("ebs.csi.aws.com", "vol-1"))
+			if tc.beta != "" {
+				betaClass(pv, tc.beta)
+			}
+			c := cacheVolume(pv)
+			if c.StorageClass != tc.want || utf16Len(c.StorageClass) > v1.MaxNameLength {
+				t.Errorf("StorageClass = %q (%d UTF-16 units), want %q within the cap of %d", c.StorageClass, utf16Len(c.StorageClass), tc.want, v1.MaxNameLength)
+			}
+			if c.Name != "pvc-1" || c.CapacityBytes != 10<<30 || c.VolumeHandle != "vol-1" {
+				t.Errorf("volume = %+v, want pvc-1 still sent with its capacity and handle", c)
+			}
+			if c.ClaimNamespace != claimNamespace || utf16Len(c.ClaimNamespace) > maxNamespaceLength ||
+				c.ClaimName != claimName || utf16Len(c.ClaimName) > v1.MaxNameLength {
+				t.Errorf("claim = %s/%s, want the bound claim at its caps", c.ClaimNamespace, c.ClaimName)
+			}
+		})
 	}
 }

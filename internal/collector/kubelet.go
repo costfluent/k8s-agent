@@ -17,7 +17,9 @@ import (
 	"github.com/prometheus/common/model"
 	"go.uber.org/zap"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 
+	v1 "github.com/costfluent/k8s-agent/api/v1"
 	"github.com/costfluent/k8s-agent/internal/config"
 	"github.com/costfluent/k8s-agent/internal/metrics"
 )
@@ -68,8 +70,8 @@ type KubeletCollector struct {
 	prev map[string]map[ContainerKey]counterSample
 }
 
-// NewKubeletCollector uses client, which must carry the service-account bearer token and the TLS
-// settings for the kubelets.
+// NewKubeletCollector uses client, which must carry the bearer token the kubelets accept and the
+// TLS settings for them; a failure to get that token is a *TokenError.
 func NewKubeletCollector(client *http.Client, addressTypes []corev1.NodeAddressType, maxConcurrency int, logger *zap.Logger) *KubeletCollector {
 	return &KubeletCollector{
 		client:       client,
@@ -82,13 +84,13 @@ func NewKubeletCollector(client *http.Client, addressTypes []corev1.NodeAddressT
 	}
 }
 
-// Scrape reads every node, a few at a time, and returns the usage and the nodes that failed. A node
-// that fails is counted and left out; it never aborts the poll.
-func (c *KubeletCollector) Scrape(ctx context.Context, nodes []*corev1.Node) (map[ContainerKey]ContainerUsage, map[string]bool) {
+// Scrape reads every node, a few at a time, and returns the usage and, per node that failed, the
+// v1.Unscraped* reason. A node that fails is counted and left out; it never aborts the poll.
+func (c *KubeletCollector) Scrape(ctx context.Context, nodes []*corev1.Node) (map[ContainerKey]ContainerUsage, map[string]string) {
 	type result struct {
 		node    string
 		samples map[ContainerKey]rawSample
-		failed  bool
+		failed  string
 	}
 	results := make(chan result, len(nodes))
 	sem := make(chan struct{}, c.concurrency(len(nodes)))
@@ -102,8 +104,9 @@ func (c *KubeletCollector) Scrape(ctx context.Context, nodes []*corev1.Node) (ma
 			samples, err := c.scrapeNode(ctx, node)
 			if err != nil {
 				metrics.NodeScrapes.WithLabelValues("error").Inc()
-				c.logger.Warn("kubelet scrape failed", zap.String("node", node.Name), zap.Error(err))
-				results <- result{node: node.Name, failed: true}
+				reason := unscrapedReason(err)
+				c.logger.Warn("kubelet scrape failed", zap.String("node", node.Name), zap.String("reason", reason), zap.Error(err))
+				results <- result{node: node.Name, failed: reason}
 				return
 			}
 			metrics.NodeScrapes.WithLabelValues("ok").Inc()
@@ -126,13 +129,13 @@ func (c *KubeletCollector) Scrape(ctx context.Context, nodes []*corev1.Node) (ma
 	}
 
 	usage := map[ContainerKey]ContainerUsage{}
-	var failed map[string]bool
+	var failed map[string]string
 	for r := range results {
-		if r.failed {
+		if r.failed != "" {
 			if failed == nil {
-				failed = map[string]bool{}
+				failed = map[string]string{}
 			}
-			failed[r.node] = true
+			failed[r.node] = r.failed
 			continue
 		}
 		prev := c.prev[r.node]
@@ -210,13 +213,16 @@ func (c *KubeletCollector) scrapeNode(ctx context.Context, node *corev1.Node) (m
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("GET %s: status %d (the agent's ClusterRole needs nodes/metrics get)", endpoint, resp.StatusCode)
+		return nil, &statusError{endpoint: endpoint, code: resp.StatusCode}
 	}
 	body := &cappedReader{r: resp.Body, left: c.maxBody}
 	samples, err := parseResourceMetrics(body, time.Now())
 	if body.truncated {
+		// Kubelet writes each metric family whole, so the containers past the cut, and for an early
+		// cut every container's memory, have no sample, and a container without one is credited zero
+		// usage. A partial body is refused even when it parses, so the node is reported as unscraped.
 		metrics.KubeletBodiesTruncated.Inc()
-		c.logger.Warn("kubelet metrics cut at the size limit; containers past it are missing", zap.String("node", node.Name), zap.Int64("limit_bytes", c.maxBody))
+		return nil, fmt.Errorf("kubelet metrics exceed the %d byte limit; the node is left out of this poll", c.maxBody)
 	}
 	return samples, err
 }
@@ -256,7 +262,7 @@ func (c *KubeletCollector) endpoint(node *corev1.Node) (string, error) {
 			}
 		}
 	}
-	return "", fmt.Errorf("node %s has no address of types %v", node.Name, c.addressTypes)
+	return "", &noAddressError{node: node.Name, types: c.addressTypes}
 }
 
 func parseResourceMetrics(r io.Reader, scrapedAt time.Time) (map[ContainerKey]rawSample, error) {
@@ -308,4 +314,68 @@ func containerKey(m *dto.Metric) (ContainerKey, bool) {
 		}
 	}
 	return k, k.Namespace != "" && k.Pod != "" && k.Container != ""
+}
+
+// statusError is a kubelet's answer other than 200.
+type statusError struct {
+	endpoint string
+	code     int
+}
+
+func (e *statusError) Error() string {
+	if e.code == http.StatusUnauthorized || e.code == http.StatusForbidden {
+		return fmt.Sprintf("GET %s: status %d (the kubelet refused the token: the ClusterRole of the account the agent scrapes with needs nodes/metrics get)", e.endpoint, e.code)
+	}
+	return fmt.Sprintf("GET %s: status %d", e.endpoint, e.code)
+}
+
+// noAddressError is a node without an address of the types the agent tries.
+type noAddressError struct {
+	node  string
+	types []corev1.NodeAddressType
+}
+
+func (e *noAddressError) Error() string {
+	return fmt.Sprintf("node %s has no address of types %v", e.node, e.types)
+}
+
+// TokenError is a failure to get the token a kubelet request carries, before any kubelet was
+// contacted. The transport that adds the token returns it.
+type TokenError struct{ Err error }
+
+func (e *TokenError) Error() string { return "requesting the kubelet token: " + e.Err.Error() }
+
+func (e *TokenError) Unwrap() error { return e.Err }
+
+// unscrapedReason is the v1.Unscraped* reason a scrape failed for. net.Error is never matched:
+// *url.Error, which wraps every client.Do failure, implements it, TLS failures included.
+func unscrapedReason(err error) string {
+	var (
+		tokenErr  *TokenError
+		certErr   *tls.CertificateVerificationError
+		status    *statusError
+		noAddress *noAddressError
+		opErr     *net.OpError
+		dnsErr    *net.DNSError
+	)
+	switch {
+	case errors.As(err, &tokenErr):
+		// The API server refusing the TokenRequest is the same fix as a kubelet refusing the token:
+		// the chart's RBAC for the metrics account. Any other failure to get one is not the kubelet's.
+		if apierrors.IsForbidden(err) || apierrors.IsUnauthorized(err) {
+			return v1.UnscrapedUnauthorized
+		}
+		return v1.UnscrapedOther
+	case errors.As(err, &certErr):
+		return v1.UnscrapedTLS
+	case errors.As(err, &status):
+		if status.code == http.StatusUnauthorized || status.code == http.StatusForbidden {
+			return v1.UnscrapedUnauthorized
+		}
+		return v1.UnscrapedOther
+	case errors.As(err, &noAddress), errors.As(err, &opErr), errors.As(err, &dnsErr), errors.Is(err, context.DeadlineExceeded):
+		return v1.UnscrapedUnreachable
+	default:
+		return v1.UnscrapedOther
+	}
 }

@@ -66,6 +66,22 @@ const (
 // GPULabels lists the node labels the agent sends in gpu_labels.
 var GPULabels = []string{LabelMIGStrategy, LabelGPUProduct, LabelGPUCount, LabelGPUReplicas, LabelGPUSlicesGI}
 
+// Reasons a node's kubelet could not be read, the keys of Report.UnscrapedNodes. A reason no node
+// had is left out.
+const (
+	// UnscrapedTLS: the kubelet's serving certificate failed verification.
+	UnscrapedTLS = "tls"
+	// UnscrapedUnreachable: the node had no usable address, or the connection failed or timed out.
+	UnscrapedUnreachable = "unreachable"
+	// UnscrapedUnauthorized: the kubelet refused the agent's token (401 or 403).
+	UnscrapedUnauthorized = "unauthorized"
+	// UnscrapedOther: any other failure.
+	UnscrapedOther = "other"
+)
+
+// UnscrapedReasons lists the keys Report.UnscrapedNodes may carry.
+var UnscrapedReasons = []string{UnscrapedTLS, UnscrapedUnreachable, UnscrapedUnauthorized, UnscrapedOther}
+
 // Report is one aggregated window. Windows are UTC clock hours, except the
 // first window after start, which closes early; a window never crosses
 // midnight UTC.
@@ -76,8 +92,13 @@ type Report struct {
 	AgentInstanceID string    `json:"agent_instance_id"`
 	WindowStart     time.Time `json:"window_start"`
 	WindowEnd       time.Time `json:"window_end"`
-	Nodes           []Node    `json:"nodes"`
-	Pods            []Pod     `json:"pods"`
+	// UnscrapedNodes counts, by reason, the nodes seen in the window whose kubelet the agent could
+	// not read at any poll of it, so their usage and pods are missing from the window. It carries no
+	// node name and no error text. The agent always sends it, {} when it read every node; a report
+	// without it comes from an agent too old to say.
+	UnscrapedNodes map[string]int `json:"unscraped_nodes"`
+	Nodes          []Node         `json:"nodes"`
+	Pods           []Pod          `json:"pods"`
 	// Volumes is every persistent volume seen during the window, in any phase; absent when the
 	// agent could not read storage, or the cluster has none.
 	Volumes []Volume `json:"volumes,omitempty"`

@@ -55,6 +55,8 @@ func validEnv(t *testing.T, dataDir string) {
 	t.Setenv("COSTFLUENT_NODE_ADDRESS_TYPES", "")
 	t.Setenv("COSTFLUENT_KUBE_SKIP_TLS_VERIFY", "")
 	t.Setenv("COSTFLUENT_REPORT_HTTP_PROXY", "")
+	t.Setenv("COSTFLUENT_KUBELET_SERVICE_ACCOUNT", "costfluent-k8s-agent-kubelet")
+	t.Setenv("COSTFLUENT_NAMESPACE", "costfluent")
 	t.Setenv("COSTFLUENT_METRICS_PORT", strconv.Itoa(heldPort(t)))
 	t.Setenv("COSTFLUENT_LOG_LEVEL", "error")
 	t.Setenv("COSTFLUENT_LOG_FORMAT", "json")
@@ -153,7 +155,7 @@ func TestRun_StartupFailures(t *testing.T) {
 				t.Setenv("COSTFLUENT_API_ENDPOINT", tokenReceiver(t, http.StatusForbidden,
 					`{"title":"Forbidden","detail":"API tokens are not included in the Free plan"}`))
 			},
-			wantErr: []string{"the Costfluent API refused the token", "403", "not included in the Free plan", "Mint token"},
+			wantErr: []string{"the Costfluent API refused the token", "403", "not included in the Free plan", "New token"},
 		},
 		{
 			name: "organization token",
@@ -162,7 +164,7 @@ func TestRun_StartupFailures(t *testing.T) {
 				t.Setenv("COSTFLUENT_API_ENDPOINT", tokenReceiver(t, http.StatusOK,
 					`{"tokenType":"organization","tokenName":"ci","capabilities":["reportKubernetesUsage"]}`))
 			},
-			wantErr: []string{`the API token "ci" is not a cluster token`, "Add", "Mint token", "agent.token"},
+			wantErr: []string{`the API token "ci" is not a cluster token`, "Add", "New token", "agent.token"},
 		},
 		{
 			name: "workspace token",
@@ -322,12 +324,14 @@ func tokenReceiver(t *testing.T, status int, body string) string {
 	return srv.URL
 }
 
-// healthPort binds a port on every interface for the agent's health server, points
-// COSTFLUENT_METRICS_PORT at it, and hands run that listener, so nothing else can bind the port
-// between this call and run serving on it.
+// healthPort binds a port for the agent's health server, points COSTFLUENT_METRICS_PORT at it, and
+// hands run that listener, so nothing else can bind the port between this call and run serving on
+// it. It binds 127.0.0.1, where the readiness probes connect, not every interface as run asks: on
+// macOS a listener on every interface leaves 127.0.0.1 on that port free for another process, whose
+// listener then takes the probes.
 func healthPort(t *testing.T) int {
 	t.Helper()
-	l, err := net.Listen("tcp", ":0")
+	l, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -360,6 +364,11 @@ func TestRun_ReportsInformersThatCannotSync(t *testing.T) {
 		t.Fatalf("err = %v, want the informer sync failure", err)
 	}
 }
+
+// probe is the readiness probes' client. Its timeout keeps one probe the agent never answers from
+// outlasting the probing loops' deadline: without it, a probe stuck on a connection nothing serves
+// waits until the test binary's own timeout.
+var probe = &http.Client{Timeout: 2 * time.Second}
 
 // startLogged runs the agent with warnings logged, waits until it reports ready, stops it, and
 // returns what it wrote to stderr, where its logger writes.
@@ -395,7 +404,7 @@ func startLoggedAt(t *testing.T, level string) string {
 	readyz := fmt.Sprintf("http://127.0.0.1:%d/readyz", port)
 	deadline := time.Now().Add(10 * time.Second)
 	for ready := false; !ready; {
-		if resp, err := http.Get(readyz); err == nil {
+		if resp, err := probe.Get(readyz); err == nil {
 			ready = resp.StatusCode == http.StatusOK
 			_ = resp.Body.Close()
 		}
@@ -551,7 +560,7 @@ func TestRun_StopsCleanlyWhenItsContextEnds(t *testing.T) {
 	readyz := fmt.Sprintf("http://127.0.0.1:%d/readyz", port)
 	deadline := time.Now().Add(10 * time.Second)
 	for ready := false; !ready; {
-		if resp, err := http.Get(readyz); err == nil {
+		if resp, err := probe.Get(readyz); err == nil {
 			ready = resp.StatusCode == http.StatusOK
 			_ = resp.Body.Close()
 		}
@@ -578,11 +587,14 @@ func TestRun_StopsCleanlyWhenItsContextEnds(t *testing.T) {
 // The port a test chooses for the agent's health server stays bound until run serves on it. A port
 // chosen and released again was once taken by the fake Kubernetes API's httptest server, which
 // binds an ephemeral port next: the agent's bind failed and its readiness probes reached the fake.
+// The address the probes dial is what stays reserved: on macOS a listener on every interface leaves
+// 127.0.0.1 on the same port free to bind, and the more specific listener then takes every
+// connection to it, so a probe once hung for thirty minutes on another process's socket.
 func TestRun_HealthPortStaysReservedUntilRunBindsIt(t *testing.T) {
 	port := healthPort(t)
-	if l, err := net.Listen("tcp", net.JoinHostPort("", strconv.Itoa(port))); err == nil {
+	if l, err := net.Listen("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(port))); err == nil {
 		_ = l.Close()
-		t.Fatalf("port %d was free for another listener before run bound it", port)
+		t.Fatalf("127.0.0.1:%d, where the readiness probes connect, was free for another listener before run bound it", port)
 	}
 }
 
@@ -685,20 +697,26 @@ func TestKubeletHTTPClient_VerifiesAgainstTheClusterCAUnlessSkipped(t *testing.T
 		return nil
 	}
 
+	clock := &fakeClock{t: time.Date(2026, 11, 4, 9, 0, 0, 0, time.UTC)}
+	api := &tokenAPI{now: clock.now}
+	clientset := fake.NewClientset()
+	clientset.PrependReactor("create", "serviceaccounts", api.react)
+	token := newKubeletToken(clientset, "costfluent", "costfluent-k8s-agent-kubelet", clock.now)
+
 	trusted := &rest.Config{Host: srv.URL, BearerToken: "sa-token", TLSClientConfig: rest.TLSClientConfig{CAData: certPEM(srv)}}
-	client, err := kubeletHTTPClient(trusted, false)
+	client, err := kubeletHTTPClient(trusted, false, token)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if err := get(client); err != nil {
 		t.Fatalf("a kubelet signed by the cluster CA was refused: %v", err)
 	}
-	if got := auth.Load(); got != "Bearer sa-token" {
-		t.Fatalf("Authorization = %q, want the service-account token", got)
+	if got := auth.Load(); got != "Bearer metrics-token-1" {
+		t.Fatalf("Authorization = %q, want the metrics token", got)
 	}
 
 	untrusted := &rest.Config{Host: srv.URL, BearerToken: "sa-token", TLSClientConfig: rest.TLSClientConfig{CAData: otherCA(t)}}
-	client, err = kubeletHTTPClient(untrusted, false)
+	client, err = kubeletHTTPClient(untrusted, false, token)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -708,15 +726,15 @@ func TestKubeletHTTPClient_VerifiesAgainstTheClusterCAUnlessSkipped(t *testing.T
 	}
 
 	auth.Store("")
-	client, err = kubeletHTTPClient(untrusted, true)
+	client, err = kubeletHTTPClient(untrusted, true, token)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if err := get(client); err != nil {
 		t.Fatalf("skipVerify must accept a self-signed kubelet: %v", err)
 	}
-	if got := auth.Load(); got != "Bearer sa-token" {
-		t.Fatalf("Authorization = %q after skipVerify, want the token kept", got)
+	if got := auth.Load(); got != "Bearer metrics-token-1" {
+		t.Fatalf("Authorization = %q after skipVerify, want the metrics token kept", got)
 	}
 	if untrusted.Insecure || untrusted.CAData == nil {
 		t.Fatal("kubeletHTTPClient must not modify the caller's rest.Config")
@@ -725,10 +743,11 @@ func TestKubeletHTTPClient_VerifiesAgainstTheClusterCAUnlessSkipped(t *testing.T
 
 func TestKubeletHTTPClient_ReportsAnUnreadableCA(t *testing.T) {
 	cfg := &rest.Config{Host: "https://127.0.0.1:1", TLSClientConfig: rest.TLSClientConfig{CAFile: filepath.Join(t.TempDir(), "missing-ca.crt")}}
-	if _, err := kubeletHTTPClient(cfg, false); err == nil || !strings.Contains(err.Error(), "kubelet transport") {
+	token := newKubeletToken(fake.NewClientset(), "costfluent", "costfluent-k8s-agent-kubelet", time.Now)
+	if _, err := kubeletHTTPClient(cfg, false, token); err == nil || !strings.Contains(err.Error(), "kubelet transport") {
 		t.Fatalf("err = %v, want a kubelet transport error", err)
 	}
-	if _, err := kubeletHTTPClient(cfg, true); err != nil {
+	if _, err := kubeletHTTPClient(cfg, true, token); err != nil {
 		t.Fatalf("skipVerify ignores the CA file, so it must not fail: %v", err)
 	}
 }
@@ -879,6 +898,19 @@ func TestAgent_PutLogsALostWindowWhenTheBufferFails(t *testing.T) {
 	}
 	if logs.FilterMessage("window closed").Len() != 0 {
 		t.Fatal("a window that was not buffered must not be logged as closed")
+	}
+}
+
+func TestAgent_PutLogsTheUnscrapedCountsBesideNodesAndPods(t *testing.T) {
+	now := recentHour()
+	a, logs := newTestAgent(t, &fakeSender{}, now)
+	a.put(v1.Report{ClusterID: "test-cluster", WindowStart: now, WindowEnd: now.Add(time.Hour), UnscrapedNodes: map[string]int{v1.UnscrapedTLS: 3}})
+	entries := logs.FilterMessage("window closed").All()
+	if len(entries) != 1 {
+		t.Fatalf("window closed logged %d times, want 1", len(entries))
+	}
+	if got := fmt.Sprint(entries[0].ContextMap()["unscraped_nodes"]); got != "map[tls:3]" {
+		t.Fatalf("unscraped_nodes = %s, want map[tls:3]", got)
 	}
 }
 
@@ -1052,6 +1084,33 @@ func TestAgent_PollBuffersTheWindowsItCloses(t *testing.T) {
 	}
 	if n, _ := a.buffer.Len(); n != 1 {
 		t.Fatalf("buffered = %d, want exactly the closed first window", n)
+	}
+}
+
+// An install closer to the hour than the first window runs has its first window ended by the
+// hour, like every hourly window, and still reports as that window closes.
+func TestAgent_SendsAFirstWindowTheHourEndsAsItCloses(t *testing.T) {
+	// The sender holds a window by the real clock, so the window ends at the next real hour: a held
+	// one would not be sent until after the hour.
+	end := time.Now().UTC().Truncate(time.Hour).Add(time.Hour)
+	start := end.Add(-collector.FirstWindow / 2)
+	client := &fakeSender{outcome: reporter.Accepted}
+	a, _ := newTestAgent(t, client, start)
+	at := start
+	a.now = func() time.Time { return at }
+	a.collect = func(_ context.Context, now time.Time) (collector.Observation, error) {
+		return collector.Observation{Time: now, Nodes: []v1.Node{{Name: "node-a"}}}, nil
+	}
+	for offset := time.Duration(0); offset <= collector.FirstWindow/2; offset += 10 * time.Second {
+		at = start.Add(offset)
+		a.poll(context.Background())
+	}
+
+	a.sender.Drain(context.Background(), false)
+	sent := client.sent()
+	if len(sent) != 1 || !sent[0].WindowStart.Equal(start) || !sent[0].WindowEnd.Equal(end) {
+		t.Fatalf("sent %d reports, want the first window %s to %s sent as it closed",
+			len(sent), start.Format(time.RFC3339), end.Format(time.RFC3339))
 	}
 }
 

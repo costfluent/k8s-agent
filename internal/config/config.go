@@ -2,6 +2,7 @@
 package config
 
 import (
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"net/url"
@@ -12,6 +13,7 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/util/validation"
 )
 
 const (
@@ -66,8 +68,17 @@ type Config struct {
 	// CollectPVCLabels sends each bound volume's claim labels, which takes listing every claim.
 	CollectPVCLabels bool
 	ReportHTTPProxy  *url.URL
-	DataDir          string
-	MetricsPort      int
+	// ReportRootCAs is the system pool plus COSTFLUENT_REPORT_CA_FILE's certificates, trusted for
+	// report and /v1/me traffic only; nil when the file is not set, so the system pool applies.
+	ReportRootCAs *x509.CertPool
+	// KubeletServiceAccount names the service account, in Namespace, whose token the agent requests
+	// for its kubelet scrapes, so kubelets never see the agent's own token. Empty under a chart that
+	// does not create it: the scrapes then carry the agent's own token.
+	KubeletServiceAccount string
+	// Namespace is the agent's own namespace; set whenever KubeletServiceAccount is.
+	Namespace   string
+	DataDir     string
+	MetricsPort int
 	// KubeAPIQPS and KubeAPIBurst bound the agent's requests to the Kubernetes API server.
 	KubeAPIQPS   int
 	KubeAPIBurst int
@@ -168,9 +179,37 @@ func load(lookup func(string) (string, bool)) (*Config, error) {
 	if raw := get("COSTFLUENT_REPORT_HTTP_PROXY"); raw != "" {
 		proxy, err := url.Parse(raw)
 		if err != nil || proxy.Host == "" || (proxy.Scheme != "http" && proxy.Scheme != "https") {
-			errs = append(errs, fmt.Errorf("COSTFLUENT_REPORT_HTTP_PROXY %q must be an http:// or https:// URL", raw))
+			// The value may carry the proxy's credentials, which a value without a scheme parses as
+			// a password, so neither it nor the parse error that quotes it is shown.
+			errs = append(errs, errors.New("COSTFLUENT_REPORT_HTTP_PROXY must be an http:// or https:// URL with a host; its value is not shown, as it may hold credentials"))
 		} else {
 			cfg.ReportHTTPProxy = proxy
+		}
+	}
+	if path := get("COSTFLUENT_REPORT_CA_FILE"); path != "" {
+		pool, err := reportRootCAs(path)
+		if err != nil {
+			errs = append(errs, err)
+		} else {
+			cfg.ReportRootCAs = pool
+		}
+	}
+
+	// A chart up to 0.3.0 sets neither, and still grants the agent's own account nodes/metrics, so a
+	// newer agent under it keeps scraping with that account's token.
+	cfg.KubeletServiceAccount = get("COSTFLUENT_KUBELET_SERVICE_ACCOUNT")
+	cfg.Namespace = get("COSTFLUENT_NAMESPACE")
+	switch {
+	case cfg.KubeletServiceAccount == "":
+		cfg.Warnings = append(cfg.Warnings, "COSTFLUENT_KUBELET_SERVICE_ACCOUNT is not set, so kubelet scrapes carry the agent's own service-account token, which reads every pod; upgrade the chart so they carry a token that reads only node metrics")
+	case cfg.Namespace == "":
+		errs = append(errs, errors.New("COSTFLUENT_NAMESPACE must name the agent's namespace when COSTFLUENT_KUBELET_SERVICE_ACCOUNT is set; the chart sets both"))
+	default:
+		if err := checkName("COSTFLUENT_KUBELET_SERVICE_ACCOUNT", cfg.KubeletServiceAccount, validation.IsDNS1123Subdomain); err != nil {
+			errs = append(errs, err)
+		}
+		if err := checkName("COSTFLUENT_NAMESPACE", cfg.Namespace, validation.IsDNS1123Label); err != nil {
+			errs = append(errs, err)
 		}
 	}
 
@@ -312,4 +351,32 @@ func contains(values []int, v int) bool {
 		}
 	}
 	return false
+}
+
+// systemCertPool is x509.SystemCertPool, replaced in tests.
+var systemCertPool = x509.SystemCertPool
+
+// reportRootCAs is the system pool plus the certificates in the PEM file at path. Its errors name
+// the file and never its content, which may be a key mounted by mistake.
+func reportRootCAs(path string) (*x509.CertPool, error) {
+	data, err := os.ReadFile(path) //nolint:gosec // the path is the operator's own setting
+	if err != nil {
+		return nil, fmt.Errorf("COSTFLUENT_REPORT_CA_FILE %s cannot be read: %w", path, err)
+	}
+	pool, err := systemCertPool()
+	if err != nil {
+		return nil, fmt.Errorf("COSTFLUENT_REPORT_CA_FILE %s: loading the system certificates to add it to: %w", path, err)
+	}
+	if !pool.AppendCertsFromPEM(data) {
+		return nil, fmt.Errorf("COSTFLUENT_REPORT_CA_FILE %s holds no PEM certificate", path)
+	}
+	return pool, nil
+}
+
+// checkName holds a variable the chart sets to a Kubernetes object name.
+func checkName(key, value string, valid func(string) []string) error {
+	if problems := valid(value); len(problems) > 0 {
+		return fmt.Errorf("%s %q is not a valid name: %s", key, value, strings.Join(problems, "; "))
+	}
+	return nil
 }

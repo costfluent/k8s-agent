@@ -2,15 +2,21 @@ package collector
 
 import (
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
 	"crypto/tls"
 	"crypto/x509"
+	"crypto/x509/pkix"
 	"errors"
 	"fmt"
 	"maps"
 	"math"
+	"math/big"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"runtime"
 	"strconv"
@@ -25,11 +31,14 @@ import (
 	"go.uber.org/zap/zaptest/observer"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	k8sruntime "k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/kubernetes/fake"
 	clienttesting "k8s.io/client-go/testing"
 
+	v1 "github.com/costfluent/k8s-agent/api/v1"
 	"github.com/costfluent/k8s-agent/internal/config"
 	"github.com/costfluent/k8s-agent/internal/metrics"
 )
@@ -128,7 +137,7 @@ func TestKubeletCollector_RatesResetsMissingContainersAndSlowNodes(t *testing.T)
 	if got := testutil.ToFloat64(metrics.NodeScrapes.WithLabelValues("error")) - failedBefore; got != 2 {
 		t.Fatalf("failed scrapes = %v, want 2 (the slow node and the node without an address)", got)
 	}
-	if want := map[string]bool{"slow": true, "no-address": true}; !maps.Equal(failed, want) {
+	if want := map[string]string{"slow": v1.UnscrapedUnreachable, "no-address": v1.UnscrapedUnreachable}; !maps.Equal(failed, want) {
 		t.Fatalf("unscraped nodes = %v, want %v", failed, want)
 	}
 	if !sawAuth.Load() {
@@ -255,24 +264,79 @@ func TestKubeletCollector_StartsAScrapeOnlyWhenOneCanRun(t *testing.T) {
 	}
 }
 
-func TestKubeletCollector_CountsATruncatedBody(t *testing.T) {
-	body := fixture(t)
+// scrapeCapped scrapes one node serving body with the collector's body cap at maxBody and returns
+// the usage, the failed nodes, how far the truncation counter rose, and the warnings logged.
+func scrapeCapped(t *testing.T, body string, maxBody int) (map[ContainerKey]ContainerUsage, map[string]string, float64, *observer.ObservedLogs) {
+	t.Helper()
 	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte(body)) }))
 	defer srv.Close()
-	c := NewKubeletCollector(srv.Client(), []corev1.NodeAddressType{corev1.NodeInternalIP}, 0, zap.NewNop())
-	nodes := []*corev1.Node{kubeletNode(t, "n1", srv.URL)}
-
+	core, logs := observer.New(zapcore.WarnLevel)
+	c := NewKubeletCollector(srv.Client(), []corev1.NodeAddressType{corev1.NodeInternalIP}, 0, zap.New(core))
+	c.maxBody = int64(maxBody)
 	before := testutil.ToFloat64(metrics.KubeletBodiesTruncated)
-	c.maxBody = int64(len(body))
-	c.Scrape(context.Background(), nodes)
-	if got := testutil.ToFloat64(metrics.KubeletBodiesTruncated) - before; got != 0 {
-		t.Fatalf("a body exactly at the limit was counted as truncated %v times", got)
+	usage, failed := c.Scrape(context.Background(), []*corev1.Node{kubeletNode(t, "n1", srv.URL)})
+	return usage, failed, testutil.ToFloat64(metrics.KubeletBodiesTruncated) - before, logs
+}
+
+// assertTruncatedNodeFailed holds a truncated body to failing its node with one logged error that
+// names the size limit, and to no log entry claiming the rest of the node was reported.
+func assertTruncatedNodeFailed(t *testing.T, usage map[ContainerKey]ContainerUsage, failed map[string]string, counted float64, logs *observer.ObservedLogs) {
+	t.Helper()
+	if failed["n1"] != v1.UnscrapedOther {
+		t.Errorf("failed nodes = %v, want n1 as other: a truncated body leaves the containers past the cut without samples", failed)
 	}
-	c.maxBody = int64(len(body)) - 1
-	c.Scrape(context.Background(), nodes)
-	if got := testutil.ToFloat64(metrics.KubeletBodiesTruncated) - before; got != 1 {
-		t.Fatalf("truncated bodies = %v, want 1", got)
+	if len(usage) != 0 {
+		t.Errorf("usage has %d containers, want none from a truncated body", len(usage))
 	}
+	if counted != 1 {
+		t.Errorf("truncated bodies counted %v times, want 1", counted)
+	}
+	entries := logs.FilterMessage("kubelet scrape failed").All()
+	if len(entries) != 1 {
+		t.Fatalf("logged %d scrape failures, want 1: %v", len(entries), logs.All())
+	}
+	if logged, _ := entries[0].ContextMap()["error"].(string); !strings.Contains(logged, "byte limit") {
+		t.Errorf("logged error %q, want it to name the size limit", logged)
+	}
+	for _, e := range logs.All() {
+		if strings.Contains(e.Message, "missing") {
+			t.Errorf("logged %q, which claims part of the node was reported", e.Message)
+		}
+	}
+}
+
+func TestKubeletCollector_CountsATruncatedBody(t *testing.T) {
+	body := fixture(t)
+
+	usage, failed, counted, logs := scrapeCapped(t, body, len(body))
+	if len(failed) != 0 || len(usage) == 0 || counted != 0 || logs.Len() != 0 {
+		t.Fatalf("a body exactly at the limit: failed %v, %d containers, counted %v, logs %v; want reported in full", failed, len(usage), counted, logs.All())
+	}
+
+	for _, tc := range []struct {
+		name    string
+		maxBody int
+	}{
+		{"cut mid-line", len(body) - 1},
+		{"cut mid-family", len(body) / 2},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			usage, failed, counted, logs := scrapeCapped(t, body, tc.maxBody)
+			assertTruncatedNodeFailed(t, usage, failed, counted, logs)
+		})
+	}
+}
+
+func TestKubeletCollector_TruncatedAtALineBoundaryIsStillFailed(t *testing.T) {
+	body := fixture(t)
+	// The cut falls just before the memory family, so the parser reads a complete CPU family and
+	// succeeds on what arrived.
+	cut := strings.Index(body, "\n# HELP container_memory_working_set_bytes")
+	if cut < 0 {
+		t.Fatal("fixture no longer has the memory family")
+	}
+	usage, failed, counted, logs := scrapeCapped(t, body, cut+1)
+	assertTruncatedNodeFailed(t, usage, failed, counted, logs)
 }
 
 func appMetrics(pod string, cpu float64, at time.Time) string {
@@ -312,7 +376,7 @@ func TestKubeletCollector_ReportsAFailedNodeAndRatesItAcrossTheGapOnRecovery(t *
 	}
 
 	usage, failed := c.Scrape(context.Background(), nodes)
-	if want := map[string]bool{"flaky": true}; !maps.Equal(failed, want) {
+	if want := map[string]string{"flaky": v1.UnscrapedOther}; !maps.Equal(failed, want) {
 		t.Fatalf("unscraped nodes = %v, want %v", failed, want)
 	}
 	if _, ok := usage[web]; ok {
@@ -369,7 +433,7 @@ func TestKubeletCollector_NamesTheSkipVerifySettingOnlyForACertificateThatDoesNo
 			kubelet := NewKubeletCollector(tc.client, config.DefaultNodeAddressTypes, 0, zap.New(core))
 
 			_, failed := kubelet.Scrape(context.Background(), []*corev1.Node{tc.node})
-			if !failed["kubelet"] {
+			if failed["kubelet"] == "" {
 				t.Fatalf("failed nodes = %v, want the kubelet", failed)
 			}
 			entries := logs.FilterMessage("kubelet scrape failed").All()
@@ -408,7 +472,7 @@ func TestCollect_MarksTheNodesWhoseScrapeFailed(t *testing.T) {
 	if len(obs.Nodes) != 2 || len(obs.Pods) != 2 {
 		t.Fatalf("nodes = %+v, pods = %+v, want both", obs.Nodes, obs.Pods)
 	}
-	if want := map[string]bool{"unreachable": true}; !maps.Equal(obs.Unscraped, want) {
+	if want := map[string]string{"unreachable": v1.UnscrapedUnreachable}; !maps.Equal(obs.Unscraped, want) {
 		t.Fatalf("unscraped nodes = %v, want %v", obs.Unscraped, want)
 	}
 	if u, ok := obs.Usage[ContainerKey{"shop", "web-0", "app"}]; !ok || u.MemoryBytes != 100 {
@@ -452,6 +516,142 @@ func TestCollect_RefusesAPollItsContextEnded(t *testing.T) {
 			obs, err := Collect(ctx, m, kubelet, at)
 			if !errors.Is(err, context.Canceled) {
 				t.Fatalf("Collect = pods %+v, usage %v, unscraped %v, error %v; want the interrupted poll refused", obs.Pods, obs.Usage, obs.Unscraped, err)
+			}
+		})
+	}
+}
+
+// expiredKubelet serves with a certificate for 127.0.0.1 that expired an hour ago, and returns a
+// client that trusts that certificate, so only its expiry fails verification.
+func expiredKubelet(t *testing.T) (*httptest.Server, *http.Client) {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	tmpl := &x509.Certificate{
+		SerialNumber:          big.NewInt(1),
+		Subject:               pkix.Name{CommonName: "kubelet"},
+		IPAddresses:           []net.IP{net.IPv4(127, 0, 0, 1)},
+		NotBefore:             now.Add(-2 * time.Hour),
+		NotAfter:              now.Add(-time.Hour),
+		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageCertSign,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		BasicConstraintsValid: true,
+		IsCA:                  true,
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cert, err := x509.ParseCertificate(der)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := httptest.NewUnstartedServer(http.NotFoundHandler())
+	srv.TLS = &tls.Config{Certificates: []tls.Certificate{{Certificate: [][]byte{der}, PrivateKey: key}}, MinVersion: tls.VersionTLS12}
+	srv.StartTLS()
+	t.Cleanup(srv.Close)
+	pool := x509.NewCertPool()
+	pool.AddCert(cert)
+	return srv, &http.Client{Transport: &http.Transport{TLSClientConfig: &tls.Config{RootCAs: pool, MinVersion: tls.VersionTLS12}}}
+}
+
+func statusKubelet(t *testing.T, code int) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(code) }))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+func TestScrape_ClassifiesEachFailure(t *testing.T) {
+	ok := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(appMetrics("web-0", 1, time.Now())))
+	}))
+	defer ok.Close()
+	closed := httptest.NewTLSServer(http.NotFoundHandler())
+	closed.Close()
+	hang := make(chan struct{})
+	slow := httptest.NewTLSServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		select {
+		case <-hang:
+		case <-r.Context().Done():
+		}
+	}))
+	defer slow.Close()
+	defer close(hang)
+	expired, trustsExpired := expiredKubelet(t)
+	forbidden, unauthorized, broken := statusKubelet(t, http.StatusForbidden), statusKubelet(t, http.StatusUnauthorized), statusKubelet(t, http.StatusInternalServerError)
+	garbage := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("container_cpu_usage_seconds_total{ not metrics\n"))
+	}))
+	defer garbage.Close()
+	untrusting := &http.Client{Transport: &http.Transport{TLSClientConfig: &tls.Config{RootCAs: x509.NewCertPool(), MinVersion: tls.VersionTLS12}}}
+
+	for _, tc := range []struct {
+		name   string
+		client *http.Client
+		node   *corev1.Node
+		want   string
+	}{
+		{"an unknown CA", untrusting, kubeletNode(t, "n", ok.URL), v1.UnscrapedTLS},
+		{"an expired certificate", trustsExpired, kubeletNode(t, "n", expired.URL), v1.UnscrapedTLS},
+		{"403", forbidden.Client(), kubeletNode(t, "n", forbidden.URL), v1.UnscrapedUnauthorized},
+		{"401", unauthorized.Client(), kubeletNode(t, "n", unauthorized.URL), v1.UnscrapedUnauthorized},
+		{"a refused dial", closed.Client(), kubeletNode(t, "n", closed.URL), v1.UnscrapedUnreachable},
+		{"no address", ok.Client(), &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "n"}}, v1.UnscrapedUnreachable},
+		{"a timeout", slow.Client(), kubeletNode(t, "n", slow.URL), v1.UnscrapedUnreachable},
+		{"500", broken.Client(), kubeletNode(t, "n", broken.URL), v1.UnscrapedOther},
+		{"a body that does not parse", garbage.Client(), kubeletNode(t, "n", garbage.URL), v1.UnscrapedOther},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			core, logs := observer.New(zapcore.WarnLevel)
+			c := NewKubeletCollector(tc.client, config.DefaultNodeAddressTypes, 0, zap.New(core))
+			c.timeout = 200 * time.Millisecond
+			_, failed := c.Scrape(context.Background(), []*corev1.Node{tc.node})
+			if want := map[string]string{"n": tc.want}; !maps.Equal(failed, want) {
+				t.Fatalf("unscraped = %v, want %v", failed, want)
+			}
+			entries := logs.FilterMessage("kubelet scrape failed").All()
+			if len(entries) != 1 {
+				t.Fatalf("logged %d scrape failures, want 1", len(entries))
+			}
+			if fields := entries[0].ContextMap(); fields["reason"] != tc.want || fields["error"] == "" {
+				t.Errorf("logged %v, want the reason %q beside the error", fields, tc.want)
+			}
+		})
+	}
+}
+
+// *url.Error, which wraps every client.Do failure, implements net.Error, so matching that interface
+// would take a TLS failure for an unreachable kubelet.
+func TestUnscrapedReason_ReadsTheCauseInsideTheURLError(t *testing.T) {
+	wrap := func(err error) error {
+		return fmt.Errorf("GET https://10.0.0.1:10250/metrics/resource: %w", &url.Error{Op: "Get", URL: "https://10.0.0.1:10250/metrics/resource", Err: err})
+	}
+	for _, tc := range []struct {
+		name string
+		err  error
+		want string
+	}{
+		{"a certificate", wrap(&tls.CertificateVerificationError{Err: x509.UnknownAuthorityError{}}), v1.UnscrapedTLS},
+		{"a DNS failure", wrap(&net.OpError{Op: "dial", Err: &net.DNSError{Err: "no such host", Name: "node-1", IsNotFound: true}}), v1.UnscrapedUnreachable},
+		{"a bare DNS failure", wrap(&net.DNSError{Err: "no such host", Name: "node-1"}), v1.UnscrapedUnreachable},
+		{"a deadline", wrap(context.DeadlineExceeded), v1.UnscrapedUnreachable},
+		{"a cancelled poll", wrap(context.Canceled), v1.UnscrapedOther},
+		{"a token request the API server forbids", wrap(&TokenError{Err: apierrors.NewForbidden(schema.GroupResource{Resource: "serviceaccounts/token"}, "metrics", nil)}), v1.UnscrapedUnauthorized},
+		{"a token request the API server does not authenticate", wrap(&TokenError{Err: apierrors.NewUnauthorized("expired")}), v1.UnscrapedUnauthorized},
+		// The API server, not the kubelet, was unreachable, so the node is not called unreachable.
+		{"a token request that cannot connect", wrap(&TokenError{Err: &net.OpError{Op: "dial", Err: errors.New("connection refused")}}), v1.UnscrapedOther},
+		{"anything else", wrap(errors.New("unexpected EOF")), v1.UnscrapedOther},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.err.Error() == "" {
+				t.Fatal("the error has no text")
+			}
+			if got := unscrapedReason(tc.err); got != tc.want {
+				t.Fatalf("unscrapedReason(%v) = %q, want %q", tc.err, got, tc.want)
 			}
 		})
 	}

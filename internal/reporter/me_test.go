@@ -30,7 +30,7 @@ func TestClient_MeDecodesTheToken(t *testing.T) {
 	endpoint := meServer(t, http.StatusOK, `{"organizationId":"org_1","tokenType":"cluster","tokenName":"prod-eu",
 		"capabilities":["reportKubernetesUsage"],"clusterId":"prod-eu"}`, &seen)
 
-	me, res := NewClient(endpoint, "cf_org_secret", "1.2.3", nil).Me(context.Background())
+	me, res := NewClient(endpoint, "cf_org_secret", "1.2.3", nil, nil).Me(context.Background())
 	if res.Outcome != Accepted || res.Status != http.StatusOK {
 		t.Fatalf("result = %+v, want accepted", res)
 	}
@@ -62,7 +62,7 @@ func TestClient_MeClassifiesARefusal(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			me, res := NewClient(meServer(t, tc.status, tc.body, nil), "t", "v", nil).Me(context.Background())
+			me, res := NewClient(meServer(t, tc.status, tc.body, nil), "t", "v", nil, nil).Me(context.Background())
 			if res.Outcome != tc.outcome || res.Status != tc.status || !strings.Contains(res.Message, tc.message) {
 				t.Fatalf("result = %+v, want outcome %v with %q", res, tc.outcome, tc.message)
 			}
@@ -77,12 +77,12 @@ func TestClient_MeRetriesAnAPIItCannotReach(t *testing.T) {
 	srv := httptest.NewServer(http.NotFoundHandler())
 	srv.Close()
 	u, _ := url.Parse(srv.URL)
-	if _, res := NewClient(u, "t", "v", nil).Me(context.Background()); res.Outcome != Retry || !strings.HasPrefix(res.Message, "GET ") {
+	if _, res := NewClient(u, "t", "v", nil, nil).Me(context.Background()); res.Outcome != Retry || !strings.HasPrefix(res.Message, "GET ") {
 		t.Fatalf("result = %+v, want a retry naming the request", res)
 	}
 
 	bad := &url.URL{Scheme: "http", Host: "bad host"}
-	if _, res := NewClient(bad, "t", "v", nil).Me(context.Background()); res.Outcome != Retry || !strings.HasPrefix(res.Message, "building request:") {
+	if _, res := NewClient(bad, "t", "v", nil, nil).Me(context.Background()); res.Outcome != Retry || !strings.HasPrefix(res.Message, "building request:") {
 		t.Fatalf("result = %+v", res)
 	}
 }

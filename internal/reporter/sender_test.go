@@ -406,27 +406,40 @@ func TestSender_SpreadDoesNotHoldOldWindowsOrTheShutdownFlush(t *testing.T) {
 	}
 }
 
-func TestSender_SpreadHoldsOnlyWindowsEndingOnTheHour(t *testing.T) {
-	dataDir := t.TempDir()
-	b, err := storage.Open(dataDir, zap.NewNop())
-	if err != nil {
-		t.Fatal(err)
-	}
-	// The short first window after an install, and a window closed by a shutdown, end off the hour.
-	start := time.Now().UTC().Truncate(time.Hour).Add(-time.Hour)
-	firstWindow := sampleReport(23)
-	firstWindow.WindowStart, firstWindow.WindowEnd = start.Add(10*time.Minute), start.Add(12*time.Minute)
-	if err := b.Put(firstWindow); err != nil {
-		t.Fatal(err)
-	}
-	client := &scripted{results: []Result{{Outcome: Accepted}}}
-	s, c, _ := observedSender(t, b, client)
-	s.spread = 4 * time.Minute
-	c.now = firstWindow.WindowEnd.Add(time.Second)
+// The windows a start or a stop cuts short are sent as they close, the ones ending on the hour
+// included; TestSender_HoldsAJustClosedWindowForItsSpread holds the whole clock hour.
+func TestSender_SpreadHoldsOnlyAWholeClockHour(t *testing.T) {
+	hour := time.Now().UTC().Truncate(time.Hour).Add(-time.Hour)
+	for _, tc := range []struct {
+		name       string
+		start, end time.Time
+	}{
+		{"the first window after an install", hour.Add(10 * time.Minute), hour.Add(12 * time.Minute)},
+		{"a first window the hour ends early", hour.Add(-90 * time.Second), hour},
+		{"the window after the first", hour.Add(-48 * time.Minute), hour},
+		{"a window a shutdown closed", hour, hour.Add(20 * time.Minute)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			b, err := storage.Open(t.TempDir(), zap.NewNop())
+			if err != nil {
+				t.Fatal(err)
+			}
+			window := sampleReport(23)
+			window.WindowStart, window.WindowEnd = tc.start, tc.end
+			if err := b.Put(window); err != nil {
+				t.Fatal(err)
+			}
+			client := &scripted{results: []Result{{Outcome: Accepted}}}
+			s, c, _ := observedSender(t, b, client)
+			s.spread = 4 * time.Minute
+			c.now = tc.end.Add(time.Second)
 
-	s.Drain(context.Background(), false)
-	if client.calls != 1 || length(t, b) != 0 {
-		t.Fatalf("calls = %d; a window that does not end on the hour is not held", client.calls)
+			s.Drain(context.Background(), false)
+			if client.calls != 1 || length(t, b) != 0 {
+				t.Fatalf("calls = %d; the window %s to %s is not a whole clock hour and is sent as it closes",
+					client.calls, tc.start.Format(time.RFC3339), tc.end.Format(time.RFC3339))
+			}
+		})
 	}
 }
 

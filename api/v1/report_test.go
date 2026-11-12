@@ -20,6 +20,7 @@ func goldenReport() Report {
 		AgentInstanceID: "6f1c1d2e-3a4b-4c5d-8e9f-0a1b2c3d4e5f",
 		WindowStart:     start,
 		WindowEnd:       start.Add(time.Hour),
+		UnscrapedNodes:  map[string]int{UnscrapedTLS: 2, UnscrapedUnreachable: 1},
 		Nodes: []Node{
 			{
 				Name:                   "aks-system-12345678-vmss000000",

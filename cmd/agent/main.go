@@ -21,6 +21,9 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
+	authenticationv1 "k8s.io/api/authentication/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 
 	v1 "github.com/costfluent/k8s-agent/api/v1"
@@ -98,7 +101,7 @@ func run(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	reports := reporter.NewClient(cfg.APIEndpoint, cfg.Token, Version, cfg.ReportHTTPProxy)
+	reports := reporter.NewClient(cfg.APIEndpoint, cfg.Token, Version, cfg.ReportHTTPProxy, cfg.ReportRootCAs)
 	clusterID, fromToken, err := checkToken(ctx, reports, cfg.ClusterID, kept, logger)
 	if err != nil {
 		return err
@@ -146,7 +149,11 @@ func run(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("kubernetes client: %w", err)
 	}
-	kubeletClient, err := kubeletHTTPClient(restCfg, cfg.KubeSkipTLSVerify)
+	var token *kubeletToken
+	if cfg.KubeletServiceAccount != "" {
+		token = newKubeletToken(client, cfg.Namespace, cfg.KubeletServiceAccount, time.Now)
+	}
+	kubeletClient, err := kubeletHTTPClient(restCfg, cfg.KubeSkipTLSVerify, token)
 	if err != nil {
 		return err
 	}
@@ -217,10 +224,10 @@ func checkToken(ctx context.Context, client *reporter.Client, configured, kept s
 		return known, false, nil
 	}
 
-	const mint = "in Costfluent, use Add cluster under Kubernetes, Clusters, or Mint token on the cluster, put that token in agent.token (or the secret in agent.secret), and restart the agent; buffered reports are kept and sent then"
+	const mint = "in Costfluent, use Add cluster on the Kubernetes page, or New token on the cluster, put that token in agent.token (or the secret in agent.secret), and restart the agent; buffered reports are kept and sent then"
 	if me.TokenType == clusterTokenType && me.ClusterID == "" {
 		return "", false, fmt.Errorf("the cluster the API token %q belongs to was deleted in Costfluent: "+
-			"add the cluster again under Kubernetes, Clusters, and install its new token, or uninstall the agent", me.TokenName)
+			"add the cluster again with Add cluster on the Kubernetes page, and install its new token, or uninstall the agent", me.TokenName)
 	}
 	if me.TokenType != clusterTokenType {
 		return "", false, fmt.Errorf("the API token %q is not a cluster token, and only a cluster token can report a cluster: %s", me.TokenName, mint)
@@ -265,11 +272,16 @@ func newMux(ready *atomic.Bool, healthy func() error) *http.ServeMux {
 	return mux
 }
 
-// kubeletHTTPClient authenticates with the service-account token, re-read as it rotates, and
-// verifies kubelets against the cluster CA unless skipVerify. Many distributions (kind, Talos)
-// serve kubelet certificates that are self-signed per node, which only skipVerify accepts.
-func kubeletHTTPClient(restCfg *rest.Config, skipVerify bool) (*http.Client, error) {
+// kubeletHTTPClient sends only the metrics account's token that token mints, never the agent's own,
+// and verifies kubelets against the cluster CA unless skipVerify. Many distributions (kind, Talos)
+// serve kubelet certificates that are self-signed per node, which only skipVerify accepts, and then
+// whatever answers on a node's kubelet port receives the token. A nil token is a chart that creates
+// no metrics account: the agent's own service-account token is sent, re-read as it rotates.
+func kubeletHTTPClient(restCfg *rest.Config, skipVerify bool, token *kubeletToken) (*http.Client, error) {
 	cfg := rest.CopyConfig(restCfg)
+	if token != nil {
+		cfg = rest.AnonymousClientConfig(restCfg)
+	}
 	if skipVerify {
 		cfg.TLSClientConfig = rest.TLSClientConfig{Insecure: true}
 	}
@@ -277,7 +289,132 @@ func kubeletHTTPClient(restCfg *rest.Config, skipVerify bool) (*http.Client, err
 	if err != nil {
 		return nil, fmt.Errorf("kubelet transport: %w", err)
 	}
-	return &http.Client{Transport: rt}, nil
+	if token == nil {
+		return &http.Client{Transport: rt}, nil
+	}
+	return &http.Client{Transport: kubeletAuth{token: token, next: rt}}, nil
+}
+
+const (
+	// kubeletTokenSeconds is how long a minted kubelet token is valid.
+	kubeletTokenSeconds = 3600
+	// kubeletTokenRetry is how long a failed token request is answered from memory, so the scrapes
+	// of one poll, which all fail together, make one request, while the next poll, at least five
+	// seconds later, makes a new one.
+	kubeletTokenRetry = 2 * time.Second
+	// kubeletTokenTimeout bounds one token request. It runs on a context of its own, not a
+	// scrape's, so a hung API server ends the request rather than every scrape waiting on it.
+	kubeletTokenTimeout = 30 * time.Second
+)
+
+// kubeletToken mints, through the TokenRequest API, short-lived tokens for the service account
+// whose only permission is reading node metrics, so a kubelet never sees the agent's own token,
+// which reads every pod.
+type kubeletToken struct {
+	client    kubernetes.Interface
+	namespace string
+	account   string
+	now       func() time.Time
+
+	mu                 sync.Mutex
+	token              string
+	renewAt, expiresAt time.Time
+	failure            error
+	failedAt           time.Time
+	// inFlight is closed when the one token request in flight ends; nil while none is.
+	inFlight chan struct{}
+}
+
+func newKubeletToken(client kubernetes.Interface, namespace, account string, now func() time.Time) *kubeletToken {
+	return &kubeletToken{client: client, namespace: namespace, account: account, now: now}
+}
+
+// get returns the token, starting a renewal once four fifths of its life has passed. While the
+// token is still valid it never waits: the renewal runs in the background, one at a time, so
+// kubelet scrapes do not depend on the API server answering. Without a valid token, get waits for
+// the request in flight, at most until ctx ends, and returns its failure, a *collector.TokenError,
+// which it repeats for kubeletTokenRetry before asking again.
+func (k *kubeletToken) get(ctx context.Context) (string, error) {
+	for {
+		k.mu.Lock()
+		now := k.now()
+		token, failure := k.token, k.failure
+		valid := token != "" && now.Before(k.expiresAt)
+		if valid && now.Before(k.renewAt) {
+			k.mu.Unlock()
+			return token, nil
+		}
+		if k.inFlight == nil && (failure == nil || now.Sub(k.failedAt) >= kubeletTokenRetry) {
+			k.inFlight = make(chan struct{})
+			go k.renew(context.WithoutCancel(ctx), k.inFlight)
+		}
+		done := k.inFlight
+		k.mu.Unlock()
+		switch {
+		case valid:
+			return token, nil
+		case done == nil:
+			return "", failure
+		}
+		select {
+		case <-done:
+		case <-ctx.Done():
+			return "", &collector.TokenError{Err: fmt.Errorf("service account %s: %w", k.account, ctx.Err())}
+		}
+	}
+}
+
+// renew makes one token request, bounded by kubeletTokenTimeout and not ended by the caller that
+// started it, stores its outcome and closes done.
+func (k *kubeletToken) renew(detached context.Context, done chan struct{}) {
+	ctx, cancel := context.WithTimeout(detached, kubeletTokenTimeout)
+	defer cancel()
+	began := k.now()
+	token, expires, err := k.request(ctx, began)
+	k.mu.Lock()
+	if err != nil {
+		k.failure, k.failedAt = err, k.now()
+	} else {
+		k.token, k.expiresAt, k.failure = token, expires, nil
+		k.renewAt = began.Add(expires.Sub(began) * 4 / 5)
+	}
+	k.inFlight = nil
+	k.mu.Unlock()
+	close(done)
+}
+
+func (k *kubeletToken) request(ctx context.Context, now time.Time) (string, time.Time, error) {
+	seconds := int64(kubeletTokenSeconds)
+	tr, err := k.client.CoreV1().ServiceAccounts(k.namespace).CreateToken(ctx, k.account, &authenticationv1.TokenRequest{
+		Spec: authenticationv1.TokenRequestSpec{ExpirationSeconds: &seconds},
+	}, metav1.CreateOptions{})
+	switch {
+	case err != nil:
+	case tr.Status.Token == "":
+		err = errors.New("the API server returned no token")
+	case !tr.Status.ExpirationTimestamp.After(now):
+		err = errors.New("the API server returned a token already expired")
+	}
+	if err != nil {
+		return "", time.Time{}, &collector.TokenError{Err: fmt.Errorf("service account %s: %w", k.account, err)}
+	}
+	return tr.Status.Token, tr.Status.ExpirationTimestamp.Time, nil
+}
+
+// kubeletAuth adds the metrics account's token to each kubelet request.
+type kubeletAuth struct {
+	token *kubeletToken
+	next  http.RoundTripper
+}
+
+func (a kubeletAuth) RoundTrip(r *http.Request) (*http.Response, error) {
+	token, err := a.token.get(r.Context())
+	if err != nil {
+		return nil, err
+	}
+	r = r.Clone(r.Context())
+	r.Header.Set("Authorization", "Bearer "+token)
+	return a.next.RoundTrip(r)
 }
 
 func collectFunc(metadata *collector.Metadata, kubelet *collector.KubeletCollector) func(context.Context, time.Time) (collector.Observation, error) {
@@ -421,7 +558,7 @@ func (a *agent) put(r v1.Report) {
 		return
 	}
 	a.logger.Info("window closed", zap.Time("window_start", r.WindowStart), zap.Time("window_end", r.WindowEnd),
-		zap.Int("nodes", len(r.Nodes)), zap.Int("pods", len(r.Pods)))
+		zap.Int("nodes", len(r.Nodes)), zap.Int("pods", len(r.Pods)), zap.Any("unscraped_nodes", r.UnscrapedNodes))
 }
 
 func (a *agent) shutdown() {

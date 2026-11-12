@@ -1,4 +1,4 @@
-.PHONY: build test check-test e2e load lint fmt fmt-check vet check clean docker run help
+.PHONY: build test check-test e2e e2e-kind e2e-k3s e2e-proxy e2e-kubelet-tls load lint fmt fmt-check vet check clean docker run help
 
 # Build variables
 BINARY_NAME := costfluent-k8s-agent
@@ -89,13 +89,33 @@ run-debug: build
 deps:
 	go mod download
 
-## check-test: Run tests without leaving a coverage file
+## check-test: Run tests without leaving a coverage file, unless COVERPROFILE names one to write
 check-test:
-	go test -race ./...
+	go test -race $(if $(COVERPROFILE),-coverprofile=$(COVERPROFILE)) ./...
 
-## e2e: Install the chart into a kind cluster and assert a report reaches a stub receiver (needs docker, kind, kubectl, helm; not part of check)
-e2e:
-	go test -tags e2e -count=1 -timeout 15m -v ./test/e2e/
+# Each e2e leg runs one test in a go test of its own, so each keeps its own timeout, and is one leg
+# of the kind-smoke job in .github/workflows/toolkit-k8s-agent.yml. They need docker, kind, kubectl,
+# helm and go, and none is part of check.
+E2E_TEST := go test -tags e2e -count=1 -v ./test/e2e/
+
+## e2e: Run every e2e leg below, one after another
+e2e: e2e-kind e2e-k3s e2e-proxy e2e-kubelet-tls
+
+## e2e-kind: Install the chart into a kind cluster and assert a report reaches a stub receiver, and the agent's shutdown report
+e2e-kind:
+	$(E2E_TEST) -timeout 15m -run '^TestKindSmoke$$'
+
+## e2e-k3s: Install the chart into a k3s container as the console's self-managed choice and assert a report with usage (K3S_IMAGE, K3S_REGISTRY_MIRROR)
+e2e-k3s:
+	$(E2E_TEST) -timeout 13m -run '^TestK3s$$'
+
+## e2e-proxy: Install with agent.reportHTTPProxySecret and assert every report arrives through a credentialed CONNECT proxy
+e2e-proxy:
+	$(E2E_TEST) -timeout 11m -run '^TestKindReportProxy$$'
+
+## e2e-kubelet-tls: Install on kind with kubelet verification on and assert the first window counts every node under unscraped_nodes.tls
+e2e-kubelet-tls:
+	$(E2E_TEST) -timeout 11m -run '^TestKindKubeletVerification$$'
 
 ## load: Run the agent against a fake API server and kubelets at 1,000 nodes and 50,000 pods and hold it to its memory, API and report budgets (not part of check)
 load:

@@ -62,7 +62,7 @@ func TestAgent_ShutdownClosesTheWindowAndFlushesOnAFreshContext(t *testing.T) {
 		snapshotPath: filepath.Join(dir, snapshotFile),
 		aggregator:   collector.NewAggregator("pve-dev", "test", "id", interval, time.Now()),
 		buffer:       buffer,
-		sender:       reporter.NewSender(buffer, reporter.NewClient(endpoint, "t", "test", nil), logger),
+		sender:       reporter.NewSender(buffer, reporter.NewClient(endpoint, "t", "test", nil, nil), logger),
 		collect: func(_ context.Context, now time.Time) (collector.Observation, error) {
 			if polls.Add(1) == 5 {
 				cancel()
