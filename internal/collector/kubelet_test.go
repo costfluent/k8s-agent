@@ -16,6 +16,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/http/httptrace"
 	"net/url"
 	"os"
 	"runtime"
@@ -113,19 +114,19 @@ func TestKubeletCollector_RatesResetsMissingContainersAndSlowNodes(t *testing.T)
 	}))
 	defer healthy.Close()
 	release := make(chan struct{})
-	slow := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		select {
-		case <-release:
-		case <-r.Context().Done():
-		}
-	}))
+	// The slow kubelet holds the scrape until the test ends, never until the request's context ends:
+	// the client closes the TLS connection with a close_notify alert first, which ends that context,
+	// and the empty 200 the handler would then answer can still reach the transport as a scrape.
+	slow := httptest.NewTLSServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { <-release }))
 	defer slow.Close()
 	defer close(release)
 
+	// The slow kubelet's scrape ends as its request goes out, not on a short timeout, because the
+	// timeout bounds every node's scrape alike and a loaded machine let the healthy kubelet miss it.
+	// TestScrape_ClassifiesEachFailure's "a timeout" holds that the timeout itself ends a scrape.
 	client := healthy.Client()
-	client.Transport = authTransport{token: "sa-token", next: client.Transport}
+	client.Transport = authTransport{token: "sa-token", next: deadlinePasses{host: strings.TrimPrefix(slow.URL, "https://"), next: client.Transport}}
 	c := NewKubeletCollector(client, config.DefaultNodeAddressTypes, 0, zap.NewNop())
-	c.timeout = 200 * time.Millisecond
 	nodes := []*corev1.Node{
 		kubeletNode(t, "dev-cluster-worker-1", healthy.URL),
 		kubeletNode(t, "slow", slow.URL),
@@ -183,6 +184,25 @@ func (a authTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 	r = r.Clone(r.Context())
 	r.Header.Set("Authorization", "Bearer "+a.token)
 	return a.next.RoundTrip(r)
+}
+
+// deadlinePasses fails each request to host the way a passed deadline does, once the request is
+// written and waits for the kubelet's answer.
+type deadlinePasses struct {
+	host string
+	next http.RoundTripper
+}
+
+func (d deadlinePasses) RoundTrip(r *http.Request) (*http.Response, error) {
+	if r.URL.Host != d.host {
+		return d.next.RoundTrip(r)
+	}
+	ctx, expire := context.WithCancelCause(r.Context())
+	defer expire(nil)
+	ctx = httptrace.WithClientTrace(ctx, &httptrace.ClientTrace{
+		WroteRequest: func(httptrace.WroteRequestInfo) { expire(context.DeadlineExceeded) },
+	})
+	return d.next.RoundTrip(r.WithContext(ctx))
 }
 
 // inFlight is a kubelet that counts concurrent scrapes and holds each for a while, or until
@@ -573,12 +593,9 @@ func TestScrape_ClassifiesEachFailure(t *testing.T) {
 	closed := httptest.NewTLSServer(http.NotFoundHandler())
 	closed.Close()
 	hang := make(chan struct{})
-	slow := httptest.NewTLSServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
-		select {
-		case <-hang:
-		case <-r.Context().Done():
-		}
-	}))
+	// Held until the test ends, never until the request's context ends, for the reason the slow
+	// kubelet of TestKubeletCollector_RatesResetsMissingContainersAndSlowNodes gives.
+	slow := httptest.NewTLSServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { <-hang }))
 	defer slow.Close()
 	defer close(hang)
 	expired, trustsExpired := expiredKubelet(t)
@@ -589,6 +606,7 @@ func TestScrape_ClassifiesEachFailure(t *testing.T) {
 	defer garbage.Close()
 	untrusting := &http.Client{Transport: &http.Transport{TLSClientConfig: &tls.Config{RootCAs: x509.NewCertPool(), MinVersion: tls.VersionTLS12}}}
 
+	const timeoutCase = "a timeout"
 	for _, tc := range []struct {
 		name   string
 		client *http.Client
@@ -601,14 +619,18 @@ func TestScrape_ClassifiesEachFailure(t *testing.T) {
 		{"401", unauthorized.Client(), kubeletNode(t, "n", unauthorized.URL), v1.UnscrapedUnauthorized},
 		{"a refused dial", closed.Client(), kubeletNode(t, "n", closed.URL), v1.UnscrapedUnreachable},
 		{"no address", ok.Client(), &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "n"}}, v1.UnscrapedUnreachable},
-		{"a timeout", slow.Client(), kubeletNode(t, "n", slow.URL), v1.UnscrapedUnreachable},
+		{timeoutCase, slow.Client(), kubeletNode(t, "n", slow.URL), v1.UnscrapedUnreachable},
 		{"500", broken.Client(), kubeletNode(t, "n", broken.URL), v1.UnscrapedOther},
 		{"a body that does not parse", garbage.Client(), kubeletNode(t, "n", garbage.URL), v1.UnscrapedOther},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			core, logs := observer.New(zapcore.WarnLevel)
 			c := NewKubeletCollector(tc.client, config.DefaultNodeAddressTypes, 0, zap.New(core))
-			c.timeout = 200 * time.Millisecond
+			if tc.name == timeoutCase {
+				// Only here: every other case must fail for its own reason, and a short timeout on a
+				// loaded machine would turn its slow handshake into a timeout.
+				c.timeout = 200 * time.Millisecond
+			}
 			_, failed := c.Scrape(context.Background(), []*corev1.Node{tc.node})
 			if want := map[string]string{"n": tc.want}; !maps.Equal(failed, want) {
 				t.Fatalf("unscraped = %v, want %v", failed, want)

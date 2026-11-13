@@ -3,6 +3,7 @@
 package e2e
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"os/exec"
@@ -49,9 +50,20 @@ func (h *harness) k3sCluster(name string) string {
 			return
 		}
 		// -v also removes the anonymous volumes the image declares, which hold the cluster's state.
-		if out, err := exec.Command("docker", "rm", "-f", "-v", name).CombinedOutput(); err != nil {
-			h.t.Logf("docker rm: %v\n%s", err, out)
-		}
+		h.removeOrFail("k3s container "+name, "docker rm -f -v "+name,
+			func(ctx context.Context) ([]byte, error) {
+				return exec.CommandContext(ctx, "docker", "rm", "-f", "-v", name).CombinedOutput()
+			},
+			func(ctx context.Context) (bool, error) {
+				out, err := exec.CommandContext(ctx, "docker", "container", "inspect", name).CombinedOutput()
+				if err == nil {
+					return false, nil
+				}
+				if strings.Contains(strings.ToLower(string(out)), "no such container") {
+					return true, nil
+				}
+				return false, fmt.Errorf("docker container inspect: %w\n%s", err, out)
+			})
 	})
 	args := []string{"create", "--name", name, "--hostname", name, "--privileged",
 		"--tmpfs", "/run", "--tmpfs", "/var/run", "-p", "127.0.0.1::6443",

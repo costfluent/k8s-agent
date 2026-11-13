@@ -106,17 +106,21 @@ serves:
 
 ```bash
 make check    # gofmt, go vet, golangci-lint, go test -race, build
-make e2e      # all four legs below; each installs the chart with --wait and asserts what reaches a stub receiver over TLS
+make e2e      # all five legs below; each installs the chart with --wait and asserts what reaches a stub receiver over TLS
 make e2e-kind         # kind; the receiver's CA through agent.reportCABundle, and the agent's own account cannot get nodes/metrics
 make e2e-k3s          # k3s in a container, the console's self-managed choice; K3S_IMAGE and K3S_REGISTRY_MIRROR override it
 make e2e-proxy        # reports through a credentialed CONNECT proxy whose URL comes from agent.reportHTTPProxySecret
 make e2e-kubelet-tls  # kind with kubelet verification on: the first window has no nodes and unscraped_nodes.tls
+make e2e-upgrade      # kind; the newest published chart and agent, then helm upgrade to this tree's: same claim, same instance ID, buffered window sent
 make docker   # builds ghcr.io/costfluent/k8s-agent
 ```
 
 The e2e targets need docker, kind, kubectl and helm. It reads the chart from `../helm-charts`, or from
 `E2E_CHART`, and takes the kind node image from `KIND_NODE_IMAGE` when set. `E2E_KEEP_CLUSTER=1`
-leaves the cluster running for inspection.
+leaves the cluster running for inspection. `make e2e-upgrade` pulls the newest chart from the
+published Helm repository, or installs the package `E2E_PUBLISHED_CHART` names, and pulls the agent
+image that chart pins by digest from ghcr.io, or through the registry proxy `E2E_GHCR_MIRROR` names
+as `<host>/<project>`.
 
 `make load` holds the agent to the memory limit the chart gives its pod, `resources.limits.memory`,
 read from `../helm-charts/costfluent-k8s-agent/values.yaml`, or from `values.yaml` in the chart
