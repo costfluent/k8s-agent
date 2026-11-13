@@ -1,4 +1,4 @@
-.PHONY: build test check-test e2e e2e-kind e2e-k3s e2e-proxy e2e-kubelet-tls load lint fmt fmt-check vet check clean docker run help
+.PHONY: build test check-test e2e e2e-kind e2e-k3s e2e-proxy e2e-kubelet-tls e2e-upgrade load lint fmt fmt-check vet check clean docker run help
 
 # Build variables
 BINARY_NAME := costfluent-k8s-agent
@@ -99,7 +99,7 @@ check-test:
 E2E_TEST := go test -tags e2e -count=1 -v ./test/e2e/
 
 ## e2e: Run every e2e leg below, one after another
-e2e: e2e-kind e2e-k3s e2e-proxy e2e-kubelet-tls
+e2e: e2e-kind e2e-k3s e2e-proxy e2e-kubelet-tls e2e-upgrade
 
 ## e2e-kind: Install the chart into a kind cluster and assert a report reaches a stub receiver, and the agent's shutdown report
 e2e-kind:
@@ -116,6 +116,10 @@ e2e-proxy:
 ## e2e-kubelet-tls: Install on kind with kubelet verification on and assert the first window counts every node under unscraped_nodes.tls
 e2e-kubelet-tls:
 	$(E2E_TEST) -timeout 11m -run '^TestKindKubeletVerification$$'
+
+## e2e-upgrade: Install the newest published chart and agent on kind, upgrade the release to the tree's, and assert it keeps its claim, agent instance and buffered window (E2E_PUBLISHED_CHART, E2E_GHCR_MIRROR)
+e2e-upgrade:
+	$(E2E_TEST) -timeout 15m -run '^TestKindUpgrade$$'
 
 ## load: Run the agent against a fake API server and kubelets at 1,000 nodes and 50,000 pods and hold it to its memory, API and report budgets (not part of check)
 load:

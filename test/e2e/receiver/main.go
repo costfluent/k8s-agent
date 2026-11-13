@@ -10,6 +10,10 @@
 // when the agent is still connected then, so an agent killed before its send completes leaves no
 // report behind, however quickly it sent.
 //
+// POST /unavailable makes every later report that would be accepted answer 503 Service Unavailable
+// with no Retry-After instead, neither kept nor counted as a refusal, as the API does while it is
+// down; POST /available ends that. GET /v1/me answers as before throughout.
+//
 // It always serves plain http on :8080. When RECEIVER_TLS_CERT and RECEIVER_TLS_KEY name a PEM
 // certificate and key, it also serves the same routes over TLS on :8443, and then refuses
 // GET /v1/me and POST /v1/kubernetes/reports that arrive over plain http, so an agent that reports
@@ -65,7 +69,7 @@ func main() {
 	}
 	withTLS := certFile != ""
 	s := &store{}
-	var delayed atomic.Bool
+	var delayed, unavailable atomic.Bool
 	plainWhileTLS := func(w http.ResponseWriter, r *http.Request, route string) bool {
 		if withTLS && r.TLS == nil {
 			s.refuse(w, http.StatusBadRequest, "plain http on "+route+" while TLS is configured")
@@ -111,6 +115,11 @@ func main() {
 			s.refuse(w, http.StatusBadRequest, "body is not JSON")
 			return
 		}
+		if unavailable.Load() {
+			log.Printf("answered a report with 503 while unavailable")
+			http.Error(w, "unavailable", http.StatusServiceUnavailable)
+			return
+		}
 		if delayed.Load() {
 			// Over HTTP/1.1 the server notices a closed connection only once the body has been read
 			// to EOF, so the wait below sees the agent die only after this, whatever the decoder read.
@@ -148,6 +157,14 @@ func main() {
 	})
 	mux.HandleFunc("POST /delay", func(w http.ResponseWriter, _ *http.Request) {
 		delayed.Store(true)
+		w.WriteHeader(http.StatusNoContent)
+	})
+	mux.HandleFunc("POST /unavailable", func(w http.ResponseWriter, _ *http.Request) {
+		unavailable.Store(true)
+		w.WriteHeader(http.StatusNoContent)
+	})
+	mux.HandleFunc("POST /available", func(w http.ResponseWriter, _ *http.Request) {
+		unavailable.Store(false)
 		w.WriteHeader(http.StatusNoContent)
 	})
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {

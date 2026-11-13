@@ -140,6 +140,58 @@ func TestConvertNode_SendsOnlyTheRateAnnotations(t *testing.T) {
 	}
 }
 
+func TestConvertNode_ReadsEveryProvidersSpotAndTopologyLabels(t *testing.T) {
+	ga := map[string]string{
+		"node.kubernetes.io/instance-type": "n2-standard-4",
+		"topology.kubernetes.io/region":    "europe-west3",
+		"topology.kubernetes.io/zone":      "europe-west3-b",
+	}
+	beta := map[string]string{
+		"beta.kubernetes.io/instance-type":         "Standard_D4s_v5",
+		"failure-domain.beta.kubernetes.io/region": "westeurope",
+		"failure-domain.beta.kubernetes.io/zone":   "westeurope-2",
+	}
+	tests := []struct {
+		name                       string
+		labels                     map[string]string
+		spot                       bool
+		instanceType, region, zone string
+	}{
+		{name: "EKS spot", labels: map[string]string{"eks.amazonaws.com/capacityType": "SPOT"}, spot: true},
+		{name: "EKS on demand", labels: map[string]string{"eks.amazonaws.com/capacityType": "ON_DEMAND"}},
+		{name: "Karpenter spot", labels: map[string]string{"karpenter.sh/capacity-type": "spot"}, spot: true},
+		{name: "GKE spot", labels: map[string]string{"cloud.google.com/gke-spot": "true"}, spot: true},
+		{name: "GKE spot off", labels: map[string]string{"cloud.google.com/gke-spot": "false"}},
+		{name: "GKE preemptible", labels: map[string]string{"cloud.google.com/gke-preemptible": "true"}, spot: true},
+		{name: "AKS spot", labels: map[string]string{"kubernetes.azure.com/scalesetpriority": "spot"}, spot: true},
+		{name: "AKS spot capitalised", labels: map[string]string{"kubernetes.azure.com/scalesetpriority": "Spot"}, spot: true},
+		{name: "AKS regular", labels: map[string]string{"kubernetes.azure.com/scalesetpriority": "Regular"}},
+		{name: "no labels"},
+		{name: "beta topology only", labels: beta, instanceType: "Standard_D4s_v5", region: "westeurope", zone: "westeurope-2"},
+		{name: "GA topology wins over beta", labels: merged(beta, ga), instanceType: "n2-standard-4", region: "europe-west3", zone: "europe-west3-b"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			n := ConvertNode(&corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "n1", Labels: tc.labels}})
+			if n.Spot != tc.spot {
+				t.Errorf("spot = %v, want %v", n.Spot, tc.spot)
+			}
+			if n.InstanceType != tc.instanceType || n.Region != tc.region || n.Zone != tc.zone {
+				t.Errorf("instance type, region, zone = %q, %q, %q, want %q, %q, %q",
+					n.InstanceType, n.Region, n.Zone, tc.instanceType, tc.region, tc.zone)
+			}
+		})
+	}
+}
+
+func merged(ms ...map[string]string) map[string]string {
+	out := map[string]string{}
+	for _, m := range ms {
+		maps.Copy(out, m)
+	}
+	return out
+}
+
 func TestMetadata_PodsFiltersAndResolvesControllers(t *testing.T) {
 	cfg := &config.Config{AllowedAnnotations: []string{"owner"}, CollectNamespaceLabels: true}
 	long := strings.Repeat("é", 150)

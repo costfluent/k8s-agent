@@ -4,9 +4,9 @@
 // asserts what reaches it. The agent reports over TLS and trusts the receiver's private CA only
 // through agent.reportCABundle, which adds it to the bundle the image ships. Each test is one leg of
 // the kind-smoke job and has its own make target: TestKindSmoke (`make e2e-kind`), TestK3s
-// (`make e2e-k3s`), TestKindReportProxy (`make e2e-proxy`) and TestKindKubeletVerification
-// (`make e2e-kubelet-tls`); `make e2e` runs them all. They need docker, kind, kubectl, helm and go
-// on the PATH.
+// (`make e2e-k3s`), TestKindReportProxy (`make e2e-proxy`), TestKindKubeletVerification
+// (`make e2e-kubelet-tls`) and TestKindUpgrade (`make e2e-upgrade`); `make e2e` runs them all. They
+// need docker, kind, kubectl, helm and go on the PATH.
 package e2e
 
 import (
@@ -97,6 +97,9 @@ type harness struct {
 	storageClass string
 	// caPEM is the CA that signs the receiver's certificate, set by deployReceiver.
 	caPEM []byte
+	// diagnosing is set once installChart has registered the failure diagnostics, so a leg that
+	// installs twice logs them once.
+	diagnosing bool
 }
 
 // newHarness checks the tools every leg needs and gives the test a context that ends after within
@@ -159,6 +162,87 @@ func (h *harness) apply(manifest string) {
 // keep reports whether E2E_KEEP_CLUSTER asks to leave the cluster running for a look.
 func keep() bool { return os.Getenv("E2E_KEEP_CLUSTER") != "" }
 
+// Cleanups must end before go test's -timeout: at the test's deadline it panics and exits without
+// running the cleanups still queued, so a cluster whose removal had not started stays on the shared
+// Docker daemon, unnamed. Each Makefile leg's -timeout is only a minute over the harness's within.
+const (
+	// cleanupMargin is how long before the deadline removeOrFail has stopped and reported.
+	cleanupMargin = 10 * time.Second
+	// removalReserve is how long before the deadline the failure diagnostics stop, leaving the
+	// cluster's removal, which runs after them, its turn.
+	removalReserve = 30 * time.Second
+)
+
+// removeOrFail removes a leg's cluster and fails the test, naming it and the command that removes it
+// by hand, unless gone reports it removed: a leftover keeps running, privileged in k3s's case, beside
+// every later leg and run on a Docker daemon agents share. Success is gone reading the daemon, not
+// remove's exit status, because another run may already have removed it and docker and kind answer a
+// missing target differently across versions. It makes up to 3 attempts, 5 s apart, each a removal
+// of up to 2 minutes and a check of up to 1 minute, on contexts of their own because h.ctx has expired
+// when the leg timed out. Under a test deadline it starts an attempt only while at least 15 s remain
+// until cleanupMargin before it, caps each command at the time left until then, and reports by then.
+func (h *harness) removeOrFail(what, manual string, remove func(context.Context) ([]byte, error), gone func(context.Context) (bool, error)) {
+	h.t.Helper()
+	const (
+		attempts   = 3
+		pause      = 5 * time.Second
+		removeFor  = 2 * time.Minute
+		checkFor   = time.Minute
+		checkMin   = 5 * time.Second
+		attemptMin = 15 * time.Second
+	)
+	end, bounded := h.t.Deadline()
+	end = end.Add(-cleanupMargin)
+	left := func() time.Duration {
+		if !bounded {
+			return removeFor + checkFor
+		}
+		return time.Until(end)
+	}
+	var (
+		out      []byte
+		err      error
+		checkErr error
+		tried    int
+	)
+	for tried < attempts {
+		if tried > 0 {
+			if left() < pause+attemptMin {
+				break
+			}
+			time.Sleep(pause)
+		}
+		if left() < attemptMin {
+			break
+		}
+		tried++
+		ctx, cancel := context.WithTimeout(context.Background(), min(removeFor, left()-checkMin))
+		out, err = remove(ctx)
+		cancel()
+		ctx, cancel = context.WithTimeout(context.Background(), min(checkFor, left()))
+		var removed bool
+		removed, checkErr = gone(ctx)
+		cancel()
+		if removed {
+			return
+		}
+	}
+	stopped := ""
+	if tried < attempts {
+		stopped = fmt.Sprintf(", stopped %s before the test's deadline", (left() + cleanupMargin).Round(time.Second))
+	}
+	switch {
+	case tried == 0:
+		h.t.Errorf("%s was not removed: no time to try%s; remove it by hand with `%s`", what, stopped, manual)
+	case checkErr != nil:
+		h.t.Errorf("%s may still be on the Docker daemon: the check that it is gone failed after %d removal(s)%s: %v; check, and remove it by hand with `%s`. Last removal: %v\n%s",
+			what, tried, stopped, checkErr, manual, err, out)
+	default:
+		h.t.Errorf("%s is still on the Docker daemon after %d removal(s)%s; remove it by hand with `%s`. Last removal: %v\n%s",
+			what, tried, stopped, manual, err, out)
+	}
+}
+
 // kindCluster creates a kind cluster named prefix and the process ID, so concurrent runs on one
 // Docker daemon do not collide, from config when it is not empty, and deletes it when the test
 // ends. KIND_CLUSTER_NAME overrides the name.
@@ -170,10 +254,17 @@ func (h *harness) kindCluster(prefix, config string) string {
 			h.t.Logf("keeping kind cluster %s (KUBECONFIG=%s)", cluster, h.kubeconfig)
 			return
 		}
-		out, err := exec.Command("kind", "delete", "cluster", "--name", cluster).CombinedOutput()
-		if err != nil {
-			h.t.Logf("kind delete cluster: %v\n%s", err, out)
-		}
+		h.removeOrFail("kind cluster "+cluster, "kind delete cluster --name "+cluster,
+			func(ctx context.Context) ([]byte, error) {
+				return exec.CommandContext(ctx, "kind", "delete", "cluster", "--name", cluster).CombinedOutput()
+			},
+			func(ctx context.Context) (bool, error) {
+				out, err := exec.CommandContext(ctx, "kind", "get", "clusters").CombinedOutput()
+				if err != nil {
+					return false, fmt.Errorf("kind get clusters: %w\n%s", err, out)
+				}
+				return !slices.Contains(strings.Fields(string(out)), cluster), nil
+			})
 	})
 	args := []string{"create", "cluster", "--name", cluster, "--image", env("KIND_NODE_IMAGE", defaultNodeImage),
 		"--kubeconfig", h.kubeconfig, "--wait", "180s"}
@@ -223,11 +314,21 @@ func (h *harness) deployReceiver(fillers int) {
 	h.run("kubectl", "-n", "e2e-filler", "rollout", "status", "deployment/filler", "--timeout=180s")
 }
 
-// installAgent installs the chart as the console's command does, with helm upgrade --install
-// --wait, plus values, and returns when the install began. The agent trusts the receiver's CA
-// through agent.reportCABundle. Once installed, it holds the release to the split of the agent's
-// two accounts.
+// installAgent installs the tree's chart with the agent image buildImages built, as installChart
+// does, and returns when the install began. Once installed, it holds the release to the split of the
+// agent's two accounts.
 func (h *harness) installAgent(values ...string) time.Time {
+	h.t.Helper()
+	installed := h.installChart(h.chart, agentImage, imageTag, values...)
+	h.assertKubeletAccount()
+	return installed
+}
+
+// installChart installs chart as the console's command does, with helm upgrade --install --wait,
+// running the agent image repository:tag already loaded into the cluster, plus values, and returns
+// when the install began. The agent trusts the receiver's CA through agent.reportCABundle. On the
+// release that is already installed it is an upgrade.
+func (h *harness) installChart(chart, repository, tag string, values ...string) time.Time {
 	h.t.Helper()
 	h.apply(fmt.Sprintf(`apiVersion: v1
 kind: Namespace
@@ -242,47 +343,57 @@ metadata:
 data:
   ca.crt: %q
 `, receiverCA, h.caPEM))
-	h.t.Cleanup(func() {
-		if !h.t.Failed() {
-			return
-		}
-		// Cleanups run after the context's own cleanup cancelled it, so a command on h.ctx never
-		// starts here: the diagnostics get a context of their own.
-		diagCtx, cancel := context.WithTimeout(context.Background(), time.Minute)
-		defer cancel()
-		diag := &harness{t: h.t, ctx: diagCtx, kubeconfig: h.kubeconfig}
-		for _, c := range []struct {
-			title string
-			args  []string
-		}{
-			{"agent pods", []string{"-n", "costfluent", "describe", "pods"}},
-			{"agent logs", []string{"-n", "costfluent", "logs", "statefulset/" + agentFullname, "--tail=100"}},
-			// Conditions and allocated resources tell a starved node from an agent that never reported.
-			{"nodes", []string{"describe", "nodes"}},
-		} {
-			out, err := diag.try("kubectl", c.args...)
-			if err != nil {
-				out += fmt.Sprintf("\n(kubectl %s: %v)", strings.Join(c.args, " "), err)
-			}
-			h.t.Logf("%s:\n%s", c.title, out)
-		}
-	})
+	if !h.diagnosing {
+		h.diagnosing = true
+		h.t.Cleanup(h.logDiagnostics)
+	}
 	installed := time.Now()
-	args := []string{"upgrade", release, h.chart, "--install", "--namespace", "costfluent", "--create-namespace",
+	args := []string{"upgrade", release, chart, "--install", "--namespace", "costfluent", "--create-namespace",
 		"--wait", "--timeout", "5m",
 		"--set", "agent.token=" + token,
 		"--set", "agent.apiEndpoint=" + apiEndpoint,
 		"--set", fmt.Sprintf("agent.pollingInterval=%d", pollEvery),
 		"--set", "agent.reportCABundle.configMap=" + receiverCA,
-		"--set", "image.repository=" + agentImage,
-		"--set", "image.tag=" + imageTag,
+		"--set", "image.repository=" + repository,
+		"--set", "image.tag=" + tag,
 		"--set", "image.pullPolicy=Never"}
 	for _, v := range values {
 		args = append(args, "--set", v)
 	}
 	h.run("helm", args...)
-	h.assertKubeletAccount()
 	return installed
+}
+
+// logDiagnostics logs the agent's pods and logs and the nodes when the test failed.
+func (h *harness) logDiagnostics() {
+	if !h.t.Failed() {
+		return
+	}
+	// Cleanups run after the context's own cleanup cancelled it, so a command on h.ctx never
+	// starts here: the diagnostics get a context of their own.
+	// They stop removalReserve before the test's deadline, so the cluster's removal still gets its turn.
+	diagUntil := time.Now().Add(time.Minute)
+	if end, ok := h.t.Deadline(); ok && end.Add(-removalReserve).Before(diagUntil) {
+		diagUntil = end.Add(-removalReserve)
+	}
+	diagCtx, cancel := context.WithDeadline(context.Background(), diagUntil)
+	defer cancel()
+	diag := &harness{t: h.t, ctx: diagCtx, kubeconfig: h.kubeconfig}
+	for _, c := range []struct {
+		title string
+		args  []string
+	}{
+		{"agent pods", []string{"-n", "costfluent", "describe", "pods"}},
+		{"agent logs", []string{"-n", "costfluent", "logs", "statefulset/" + agentFullname, "--tail=100"}},
+		// Conditions and allocated resources tell a starved node from an agent that never reported.
+		{"nodes", []string{"describe", "nodes"}},
+	} {
+		out, err := diag.try("kubectl", c.args...)
+		if err != nil {
+			out += fmt.Sprintf("\n(kubectl %s: %v)", strings.Join(c.args, " "), err)
+		}
+		h.t.Logf("%s:\n%s", c.title, out)
+	}
 }
 
 // assertKubeletAccount holds the chart to sending kubelets only the metrics account's token: the
@@ -624,11 +735,16 @@ func decode(body json.RawMessage) (v1.Report, string) {
 	if err := dec.Decode(&r); err != nil {
 		return r, fmt.Sprintf("report does not decode into api/v1: %v", err)
 	}
-	if r.SchemaVersion != v1.SchemaVersion || r.ClusterID != clusterID || r.AgentInstanceID == "" || r.AgentVersion != agentVersion {
-		return r, fmt.Sprintf("header: schema %d, cluster %q, instance %q, agent version %q (built with %q)",
-			r.SchemaVersion, r.ClusterID, r.AgentInstanceID, r.AgentVersion, agentVersion)
+	return r, checkHeader(r, agentVersion)
+}
+
+// checkHeader holds r to the header every report carries, from an agent built as version.
+func checkHeader(r v1.Report, version string) string {
+	if r.SchemaVersion != v1.SchemaVersion || r.ClusterID != clusterID || r.AgentInstanceID == "" || r.AgentVersion != version {
+		return fmt.Sprintf("header: schema %d, cluster %q, instance %q, agent version %q (built with %q)",
+			r.SchemaVersion, r.ClusterID, r.AgentInstanceID, r.AgentVersion, version)
 	}
-	return r, ""
+	return ""
 }
 
 // check holds a report to carrying usage: nodes, kube-system pods with CPU and memory, and the

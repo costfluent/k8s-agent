@@ -208,6 +208,37 @@ func TestAggregator_SlowPollIsCreditedInFull(t *testing.T) {
 	}
 }
 
+func TestAggregator_ClockSteppedBackIsIgnored(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		back time.Duration
+	}{
+		{"a step back", 30 * time.Second},
+		{"a repeated instant", time.Minute},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			start := t0.Truncate(time.Hour).Add(5 * time.Minute)
+			a := NewAggregator("c", "v", "id", time.Minute, start)
+			a.Observe(obsAt(start, []string{"n1"}, nil, nil))
+			a.Observe(obsAt(start.Add(time.Minute), []string{"n1"}, nil, nil))
+
+			elapsedBefore, creditedBefore := testutil.ToFloat64(metrics.ElapsedSeconds), testutil.ToFloat64(metrics.CreditedSeconds)
+			if got := a.Observe(obsAt(start.Add(tc.back), []string{"n1"}, nil, nil)); len(got) != 0 {
+				t.Fatalf("an observation at or before the last one closed %+v", got)
+			}
+			if elapsed, creditedSeconds := testutil.ToFloat64(metrics.ElapsedSeconds)-elapsedBefore, testutil.ToFloat64(metrics.CreditedSeconds)-creditedBefore; elapsed != 0 || creditedSeconds != 0 {
+				t.Fatalf("an observation at or before the last one moved the counters: elapsed %v, credited %v", elapsed, creditedSeconds)
+			}
+
+			// start+2m is the end of the short first window, so this observation closes it.
+			closed := a.Observe(obsAt(start.Add(2*time.Minute), []string{"n1"}, nil, nil))
+			if len(closed) != 1 || !closed[0].WindowStart.Equal(start) || !near(closed[0].Nodes[0].ObservedSeconds, 120) {
+				t.Fatalf("closed = %+v, want the first window with 120 observed seconds", closed)
+			}
+		})
+	}
+}
+
 func TestAggregator_SnapshotRestoresAnOpenWindow(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "window.json")
 	a := NewAggregator("c", "v", "id", 60*time.Second, t0)
