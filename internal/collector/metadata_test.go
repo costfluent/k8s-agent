@@ -8,6 +8,7 @@ import (
 	"reflect"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 	"unicode/utf16"
@@ -15,14 +16,18 @@ import (
 	"github.com/prometheus/client_golang/prometheus/testutil"
 
 	"go.uber.org/zap"
+	"go.uber.org/zap/zaptest/observer"
 	appsv1 "k8s.io/api/apps/v1"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	storagev1 "k8s.io/api/storage/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes/fake"
 	"k8s.io/client-go/rest"
+	clienttesting "k8s.io/client-go/testing"
 	"k8s.io/client-go/tools/cache"
 
 	v1 "github.com/costfluent/k8s-agent/api/v1"
@@ -52,6 +57,12 @@ func startMetadata(t *testing.T, cfg *config.Config, objects ...interface{ GetNa
 // startMetadataWith starts the informers over a fake API server holding objects, after prepare,
 // when given, has added its reactors.
 func startMetadataWith(t *testing.T, cfg *config.Config, prepare func(*fake.Clientset), objects ...interface{ GetName() string }) (*Metadata, *fake.Clientset) {
+	t.Helper()
+	return startMetadataLogging(t, cfg, zap.NewNop(), prepare, objects...)
+}
+
+// startMetadataLogging is startMetadataWith logging to logger.
+func startMetadataLogging(t *testing.T, cfg *config.Config, logger *zap.Logger, prepare func(*fake.Clientset), objects ...interface{ GetName() string }) (*Metadata, *fake.Clientset) {
 	t.Helper()
 	client := fake.NewClientset()
 	if prepare != nil {
@@ -85,7 +96,7 @@ func startMetadataWith(t *testing.T, cfg *config.Config, prepare func(*fake.Clie
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	t.Cleanup(cancel)
-	m := NewMetadata(client, cfg, zap.NewNop())
+	m := NewMetadata(client, cfg, logger)
 	if err := m.Start(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -251,6 +262,117 @@ func TestMetadata_PodsFiltersAndResolvesControllers(t *testing.T) {
 	if orphan.ControllerKind != "ReplicaSet" || orphan.Controller != "missing" {
 		t.Errorf("unresolvable owner = %s/%s", orphan.ControllerKind, orphan.Controller)
 	}
+}
+
+func TestMetadata_NamespaceLabelsCachedRefreshedAndKeptOnFailure(t *testing.T) {
+	cfg := &config.Config{CollectNamespaceLabels: true}
+	rnd := map[string]string{"cost-center": "rnd"}
+	objects := func() []interface{ GetName() string } {
+		return []interface{ GetName() string }{
+			&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "ml", Labels: map[string]string{"cost-center": "rnd"}}},
+			runningPod("ml", "web", "n1", nil, nil, nil, corev1.Container{Name: "web"}),
+		}
+	}
+	namespaceLists := func(client *fake.Clientset) int {
+		n := 0
+		for _, a := range client.Actions() {
+			if a.GetVerb() == "list" && a.GetResource().Resource == "namespaces" {
+				n++
+			}
+		}
+		return n
+	}
+	labelsOnPoll := func(t *testing.T, m *Metadata) map[string]string {
+		t.Helper()
+		pods, err := m.Pods(context.Background())
+		if err != nil || len(pods) != 1 {
+			t.Fatalf("pods = %+v, %v; want the one running pod", pods, err)
+		}
+		return pods[0].NamespaceLabels
+	}
+	pastTheRefresh := func(m *Metadata) {
+		m.mu.Lock()
+		defer m.mu.Unlock()
+		m.namespacesAt = m.namespacesAt.Add(-namespaceLabelsRefresh - time.Second)
+	}
+	var refused atomic.Int32
+	refuse := func(client *fake.Clientset) {
+		client.PrependReactor("list", "namespaces", func(clienttesting.Action) (bool, runtime.Object, error) {
+			refused.Add(1)
+			return true, nil, apierrors.NewServiceUnavailable("the API server is restarting")
+		})
+	}
+	const keeping = "keeping the previous namespace labels"
+
+	t.Run("within the refresh", func(t *testing.T) {
+		m, client := startMetadataWith(t, cfg, nil, objects()...)
+		first, second := labelsOnPoll(t, m), labelsOnPoll(t, m)
+		if !reflect.DeepEqual(first, rnd) || !reflect.DeepEqual(second, rnd) {
+			t.Errorf("namespace labels = %v then %v, want %v on both polls", first, second, rnd)
+		}
+		if n := namespaceLists(client); n != 1 {
+			t.Errorf("namespaces listed %d times in two polls, want once per refresh", n)
+		}
+	})
+
+	t.Run("past the refresh", func(t *testing.T) {
+		m, client := startMetadataWith(t, cfg, nil, objects()...)
+		if got := labelsOnPoll(t, m); !reflect.DeepEqual(got, rnd) {
+			t.Fatalf("first poll namespace labels = %v, want %v", got, rnd)
+		}
+		relabelled := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "ml", Labels: map[string]string{"cost-center": "ops"}}}
+		if _, err := client.CoreV1().Namespaces().Update(context.Background(), relabelled, metav1.UpdateOptions{}); err != nil {
+			t.Fatal(err)
+		}
+		if got := labelsOnPoll(t, m); !reflect.DeepEqual(got, rnd) {
+			t.Errorf("namespace labels within the refresh = %v, want the cached %v", got, rnd)
+		}
+		pastTheRefresh(m)
+		if got := labelsOnPoll(t, m); !reflect.DeepEqual(got, map[string]string{"cost-center": "ops"}) {
+			t.Errorf("namespace labels past the refresh = %v, want the relabelled cost-center ops", got)
+		}
+		if n := namespaceLists(client); n != 2 {
+			t.Errorf("namespaces listed %d times, want once at the start and once past the refresh", n)
+		}
+	})
+
+	t.Run("refused after a success", func(t *testing.T) {
+		refused.Store(0)
+		core, logs := observer.New(zap.WarnLevel)
+		m, client := startMetadataLogging(t, cfg, zap.New(core), nil, objects()...)
+		if got := labelsOnPoll(t, m); !reflect.DeepEqual(got, rnd) {
+			t.Fatalf("first poll namespace labels = %v, want %v", got, rnd)
+		}
+		refuse(client)
+		pastTheRefresh(m)
+		if got := labelsOnPoll(t, m); !reflect.DeepEqual(got, rnd) {
+			t.Errorf("namespace labels after a refused list = %v, want the previous %v", got, rnd)
+		}
+		if refused.Load() != 1 {
+			t.Errorf("%d refused namespace lists, want the poll past the refresh to list once", refused.Load())
+		}
+		if n := logs.FilterMessageSnippet(keeping).Len(); n != 1 {
+			t.Errorf("%d warnings saying %q, want one: %v", n, keeping, logs.All())
+		}
+	})
+
+	t.Run("refused before any success", func(t *testing.T) {
+		refused.Store(0)
+		core, logs := observer.New(zap.WarnLevel)
+		m, _ := startMetadataLogging(t, cfg, zap.New(core), refuse, objects()...)
+		if got := labelsOnPoll(t, m); got != nil {
+			t.Errorf("namespace labels = %v with every namespace list refused, want none", got)
+		}
+		if got := labelsOnPoll(t, m); got != nil {
+			t.Errorf("namespace labels on the second poll = %v, want none", got)
+		}
+		if refused.Load() != 2 {
+			t.Errorf("%d namespace lists in two polls, want each poll to list again while none succeeded", refused.Load())
+		}
+		if n := logs.FilterMessageSnippet(keeping).Len(); n != 2 {
+			t.Errorf("%d warnings saying %q, want one per refused list: %v", n, keeping, logs.All())
+		}
+	})
 }
 
 func TestMetadata_DefaultsSendNoAnnotationsOrNamespaceLabels(t *testing.T) {

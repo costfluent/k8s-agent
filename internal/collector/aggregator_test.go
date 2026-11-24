@@ -96,6 +96,47 @@ func TestAggregator_AllocatesMaxOfRequestAndUsage(t *testing.T) {
 	}
 }
 
+func TestAggregator_PeaksAreTheWindowsMaximum(t *testing.T) {
+	a := NewAggregator("c", "0.2.0", "id", 10*time.Second, t0)
+	app := ContainerKey{"shop", "web-0", "app"}
+	// Poll 1 has no CPU rate yet, so its CPUCores must not count; poll 3 is the peak, and the
+	// window ends on lower usage, so neither the first nor the last poll is the maximum.
+	polls := []ContainerUsage{
+		{CPUCores: 2, HasCPU: false, MemoryBytes: 30},
+		{CPUCores: 0.2, HasCPU: true, MemoryBytes: 40},
+		{CPUCores: 0.9, HasCPU: true, MemoryBytes: 150},
+	}
+	for len(polls) < 12 {
+		polls = append(polls, ContainerUsage{CPUCores: 0.3, HasCPU: true, MemoryBytes: 60})
+	}
+	pods := []PodInfo{webPod("n1")}
+
+	closed := a.Observe(obsAt(t0, []string{"n1"}, pods, nil))
+	for i, u := range polls {
+		closed = append(closed, a.Observe(obsAt(t0.Add(time.Duration(i+1)*10*time.Second), []string{"n1"}, pods, map[ContainerKey]ContainerUsage{app: u}))...)
+	}
+
+	if len(closed) != 1 {
+		t.Fatalf("closed %d windows, want 1", len(closed))
+	}
+	p := findPod(closed[0], "web-0", "n1")
+	if p == nil || len(p.Containers) != 2 {
+		t.Fatalf("pod = %+v", p)
+	}
+	c := p.Containers[0]
+	if !near(c.CPUUsagePeakCores, 0.9) || c.MemoryUsagePeakBytes != 150 {
+		t.Errorf("peaks = %v cores, %d bytes, want 0.9 and 150", c.CPUUsagePeakCores, c.MemoryUsagePeakBytes)
+	}
+	// 0 + 0.2*10 + 0.9*10 + 9 polls of 0.3*10; the request of 0.5 cores and 100 bytes is
+	// allocated except where usage is above it.
+	if !near(c.ObservedSeconds, 120) || !near(c.CPUUsageCoreSeconds, 38) || !near(c.CPUAllocatedCoreSeconds, 11*0.5*10+0.9*10) {
+		t.Errorf("app cpu = %+v", c)
+	}
+	if !near(c.MemoryUsageByteSeconds, (30+40+150+9*60)*10) || !near(c.MemoryAllocatedByteSeconds, (11*100+150)*10) {
+		t.Errorf("app memory = %+v", c)
+	}
+}
+
 func TestAggregator_SendsEachContainersGPURequests(t *testing.T) {
 	a := NewAggregator("c", "0.4.0", "id", 10*time.Second, t0)
 	pod := webPod("n1")

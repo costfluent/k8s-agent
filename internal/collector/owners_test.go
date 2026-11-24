@@ -11,6 +11,7 @@ import (
 
 	"go.uber.org/zap"
 	appsv1 "k8s.io/api/apps/v1"
+	batchv1 "k8s.io/api/batch/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -63,6 +64,81 @@ func TestMetadata_OwnerCacheEvictsTheLeastRecentlyUsed(t *testing.T) {
 		}
 		if fetched := gets() > before; fetched != step.fetched {
 			t.Fatalf("step %d (%s): fetched = %v, want %v; the cache must keep the two most recently used owners", i, step.owner, fetched, step.fetched)
+		}
+	}
+}
+
+func getsOf(client *fake.Clientset, resource string) int {
+	n := 0
+	for _, a := range client.Actions() {
+		if a.GetVerb() == "get" && a.GetResource().Resource == resource {
+			n++
+		}
+	}
+	return n
+}
+
+func TestMetadata_RetriesAControllerWhoseLookupFailed(t *testing.T) {
+	for _, tc := range []struct {
+		ownerKind, ownerName, resource, wantKind, wantName string
+		object                                             runtime.Object
+	}{
+		{"ReplicaSet", "web-7f9", "replicasets", "Deployment", "web",
+			&appsv1.ReplicaSet{ObjectMeta: metav1.ObjectMeta{Namespace: "shop", Name: "web-7f9", OwnerReferences: controllerRef("Deployment", "web")}}},
+		{"Job", "report-2911", "jobs", "CronJob", "report",
+			&batchv1.Job{ObjectMeta: metav1.ObjectMeta{Namespace: "shop", Name: "report-2911", OwnerReferences: controllerRef("CronJob", "report")}}},
+	} {
+		t.Run(tc.ownerKind, func(t *testing.T) {
+			client := fake.NewClientset(tc.object)
+			failed := false
+			client.PrependReactor("get", tc.resource, func(clienttesting.Action) (bool, runtime.Object, error) {
+				if failed {
+					return false, nil, nil
+				}
+				failed = true
+				return true, nil, apierrors.NewTooManyRequests("throttled", 1)
+			})
+			m := NewMetadata(client, &config.Config{OwnerCacheSize: 8}, zap.NewNop())
+			pod := &cachedPod{Namespace: "shop", OwnerKind: tc.ownerKind, OwnerName: tc.ownerName}
+
+			for i, step := range []struct {
+				kind, name string
+				gets       int
+			}{
+				{tc.ownerKind, tc.ownerName, 1}, // the throttled GET falls back to the direct owner
+				{tc.wantKind, tc.wantName, 2},   // the fallback was not cached, so the next poll asks again
+				{tc.wantKind, tc.wantName, 2},   // the resolved controller is cached
+			} {
+				kind, name := m.resolveController(context.Background(), pod)
+				if kind != step.kind || name != step.name {
+					t.Fatalf("call %d: resolved %s/%s, want %s/%s; a failed lookup's fallback must not stick", i+1, kind, name, step.kind, step.name)
+				}
+				if got := getsOf(client, tc.resource); got != step.gets {
+					t.Fatalf("call %d: %d GETs of %s, want %d", i+1, got, tc.resource, step.gets)
+				}
+			}
+		})
+	}
+}
+
+func TestMetadata_AnUnownedReplicaSetOrJobResolvesToItselfOnce(t *testing.T) {
+	client := fake.NewClientset(
+		&appsv1.ReplicaSet{ObjectMeta: metav1.ObjectMeta{Namespace: "shop", Name: "bare-rs"}},
+		&batchv1.Job{ObjectMeta: metav1.ObjectMeta{Namespace: "shop", Name: "bare-job"}},
+	)
+	m := NewMetadata(client, &config.Config{OwnerCacheSize: 8}, zap.NewNop())
+	for _, tc := range []struct{ kind, name, resource string }{
+		{"ReplicaSet", "bare-rs", "replicasets"},
+		{"Job", "bare-job", "jobs"},
+	} {
+		for call := 1; call <= 2; call++ {
+			kind, name := m.resolveController(context.Background(), &cachedPod{Namespace: "shop", OwnerKind: tc.kind, OwnerName: tc.name})
+			if kind != tc.kind || name != tc.name {
+				t.Fatalf("%s call %d: resolved %s/%s, want the owner itself", tc.kind, call, kind, name)
+			}
+		}
+		if got := getsOf(client, tc.resource); got != 1 {
+			t.Fatalf("%s: %d GETs across two calls, want 1; an owner with no controller of its own must be cached too", tc.kind, got)
 		}
 	}
 }
