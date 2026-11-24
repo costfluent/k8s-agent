@@ -42,12 +42,15 @@ type published struct {
 }
 
 // TestKindUpgrade installs the newest published release and upgrades it to the tree's chart and
-// agent with the command a customer runs, helm upgrade --install on the same release. The receiver
-// is unavailable for the upgrade, so the old agent's shutdown buffers the window it closes on the
-// volume and only the new agent can send it. The leg holds the tree to an upgrade the API server
-// accepts, which no change to an immutable StatefulSet field passes, to the new pod keeping the
-// claim, and to the new agent reading what the old one wrote there: the buffered window and the
-// agent instance ID.
+// agent with the console's Update the agent command, helm upgrade --reset-then-reuse-values, which
+// passes no value: the tree's chart renders the release's stored values, under the published
+// chart's keys, over its own defaults. A value the published install set that the tree's chart
+// renames or drops from its schema, or a value it newly requires, fails that upgrade, as it would a
+// customer's. The receiver is unavailable for the upgrade, so the old agent's shutdown buffers the
+// window it closes on the volume and only the new agent can send it. The leg holds the tree to an
+// upgrade the API server accepts, which no change to an immutable StatefulSet field passes, to the
+// new pod keeping the claim, and to the new agent reading what the old one wrote there: the
+// buffered window and the agent instance ID.
 func TestKindUpgrade(t *testing.T) {
 	h := newHarness(t, 14*time.Minute)
 	pub := h.publishedRelease()
@@ -77,10 +80,46 @@ func TestKindUpgrade(t *testing.T) {
 	h.postReceiver("unavailable")
 	upgradeStart := time.Now()
 	t.Logf("upgrading release %s from the published chart %s to the tree's chart", release, pub.version)
-	h.installAgent("agent.disableKubeTLSverify=true")
+	h.upgradeReusingValues(h.chart, agentImage, imageTag)
 	h.assertUpgraded(podUID, claimUID)
+	h.assertReusedValues()
 	h.postReceiver("available")
 	h.awaitUpgradeReports(first, pubVersion, upgradeStart)
+}
+
+// upgradeReusingValues upgrades the release to chart as the console's Update the agent command does,
+// with --reset-then-reuse-values, so every agent value comes from the release. Only the image is
+// set: the harness loads it into the cluster under its own name, and a customer never sets it. Once
+// upgraded, it holds the release to the split of the agent's two accounts, as installAgent does.
+func (h *harness) upgradeReusingValues(chart, repository, tag string) {
+	h.t.Helper()
+	h.run("helm", "upgrade", release, chart, "--namespace", "costfluent", "--reset-then-reuse-values",
+		"--wait", "--timeout", "5m",
+		"--set", "image.repository="+repository,
+		"--set", "image.tag="+tag,
+		"--set", "image.pullPolicy=Never",
+		"--set", "image.digest=")
+	h.assertKubeletAccount()
+}
+
+// assertReusedValues holds the upgraded release to the token and API endpoint the published install
+// set, which the upgrade must carry from the release rather than receive again.
+func (h *harness) assertReusedValues() {
+	h.t.Helper()
+	var values struct {
+		Agent struct {
+			Token       string `json:"token"`
+			APIEndpoint string `json:"apiEndpoint"`
+		} `json:"agent"`
+	}
+	out := h.run("helm", "get", "values", release, "--namespace", "costfluent", "-o", "json")
+	if err := json.Unmarshal([]byte(out), &values); err != nil {
+		h.t.Fatalf("helm get values %s: %v\n%s", release, err, out)
+	}
+	if values.Agent.Token != token || values.Agent.APIEndpoint != apiEndpoint {
+		h.t.Fatalf("helm get values %s after the upgrade holds agent.token %q and agent.apiEndpoint %q, want the published install's %q and %q",
+			release, values.Agent.Token, values.Agent.APIEndpoint, token, apiEndpoint)
+	}
 }
 
 // publishedRelease resolves the newest published chart, or the package E2E_PUBLISHED_CHART names,

@@ -149,6 +149,25 @@ func TestLoad_RejectsInvalidValues(t *testing.T) {
 	}
 }
 
+// The chart's schema allows ten annotation keys, so an agent given exactly ten must start.
+func TestLoad_AcceptsTheMostAllowedAnnotations(t *testing.T) {
+	cases := map[string]string{
+		"ten keys":                         "a,b,c,d,e,f,g,h,i,j",
+		"ten keys with spaces and a blank": " a, b,c,,d,e,f,g,h,i,j, ",
+	}
+	for name, raw := range cases {
+		t.Run(name, func(t *testing.T) {
+			cfg, err := load(env(map[string]string{"COSTFLUENT_TOKEN": "t", "COSTFLUENT_ALLOWED_ANNOTATIONS": raw}))
+			if err != nil {
+				t.Fatalf("COSTFLUENT_ALLOWED_ANNOTATIONS=%q: %v", raw, err)
+			}
+			if got := strings.Join(cfg.AllowedAnnotations, ","); got != "a,b,c,d,e,f,g,h,i,j" {
+				t.Errorf("AllowedAnnotations = %q, want a,b,c,d,e,f,g,h,i,j", got)
+			}
+		})
+	}
+}
+
 // The cluster token names its cluster, so the chart may leave agent.clusterID out.
 func TestLoad_ClusterIDIsOptional(t *testing.T) {
 	cfg, err := load(env(map[string]string{"COSTFLUENT_TOKEN": "t"}))

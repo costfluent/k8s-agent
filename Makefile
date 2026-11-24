@@ -1,4 +1,4 @@
-.PHONY: build test check-test e2e e2e-kind e2e-k3s e2e-proxy e2e-kubelet-tls e2e-upgrade load lint fmt fmt-check vet check clean docker run help
+.PHONY: build test check-test e2e e2e-kind e2e-k3s e2e-proxy e2e-kubelet-tls e2e-upgrade e2e-netpol load lint fmt fmt-check vet check clean docker run help
 
 # Build variables
 BINARY_NAME := costfluent-k8s-agent
@@ -99,7 +99,7 @@ check-test:
 E2E_TEST := go test -tags e2e -count=1 -v ./test/e2e/
 
 ## e2e: Run every e2e leg below, one after another
-e2e: e2e-kind e2e-k3s e2e-proxy e2e-kubelet-tls e2e-upgrade
+e2e: e2e-kind e2e-k3s e2e-proxy e2e-kubelet-tls e2e-upgrade e2e-netpol
 
 ## e2e-kind: Install the chart into a kind cluster and assert a report reaches a stub receiver, and the agent's shutdown report
 e2e-kind:
@@ -120,6 +120,10 @@ e2e-kubelet-tls:
 ## e2e-upgrade: Install the newest published chart and agent on kind, upgrade the release to the tree's, and assert it keeps its claim, agent instance and buffered window (E2E_PUBLISHED_CHART, E2E_GHCR_MIRROR)
 e2e-upgrade:
 	$(E2E_TEST) -timeout 15m -run '^TestKindUpgrade$$'
+
+## e2e-netpol: Install through the report proxy under default-deny egress and the connect guide's policy, assert a full report and no failed flow, then no report once only the default-deny is left
+e2e-netpol:
+	$(E2E_TEST) -timeout 15m -run '^TestKindDefaultDenyEgress$$'
 
 ## load: Run the agent against a fake API server and kubelets at 1,000 nodes and 50,000 pods and hold it to its memory, API and report budgets (not part of check)
 load:

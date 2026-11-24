@@ -294,6 +294,102 @@ func TestStorage_ClaimLabelsOnlyWhenCollected(t *testing.T) {
 	})
 }
 
+func TestStorage_ClaimLabelsRefreshedAndKeptOnFailure(t *testing.T) {
+	cfg := &config.Config{CollectPVCLabels: true}
+	core := map[string]string{"team": "core"}
+	objects := func() []interface{ GetName() string } {
+		return []interface{ GetName() string }{
+			persistentVolume("pvc-data", "gp3", corev1.VolumeBound, "shop/data", csi("ebs.csi.aws.com", "vol-1")),
+			&corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Namespace: "shop", Name: "data", Labels: map[string]string{"team": "core"}}},
+		}
+	}
+	claimLists := func(client *fake.Clientset) int {
+		n := 0
+		for _, a := range client.Actions() {
+			if a.GetVerb() == "list" && a.GetResource().Resource == "persistentvolumeclaims" {
+				n++
+			}
+		}
+		return n
+	}
+	labelsOnPoll := func(t *testing.T, m *Metadata) map[string]string {
+		t.Helper()
+		v := volumeNamed(volumesOf(t, m), "pvc-data")
+		if v == nil {
+			t.Fatal("pvc-data is missing from the poll")
+		}
+		return v.ClaimLabels
+	}
+	pastTheRefresh := func(m *Metadata) {
+		m.storage.claimsMu.Lock()
+		defer m.storage.claimsMu.Unlock()
+		m.storage.claimsAt = m.storage.claimsAt.Add(-claimLabelsRefresh - time.Second)
+	}
+	var refused atomic.Int32
+	refuse := func(client *fake.Clientset) {
+		client.PrependReactor("list", "persistentvolumeclaims", func(clienttesting.Action) (bool, runtime.Object, error) {
+			refused.Add(1)
+			return true, nil, apierrors.NewServiceUnavailable("the API server is restarting")
+		})
+	}
+	const keeping = "keeping the previous claim labels"
+
+	t.Run("past the refresh", func(t *testing.T) {
+		m, client := startMetadataWith(t, cfg, nil, objects()...)
+		if got := labelsOnPoll(t, m); !reflect.DeepEqual(got, core) {
+			t.Fatalf("first poll claim labels = %v, want %v", got, core)
+		}
+		relabelled := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Namespace: "shop", Name: "data", Labels: map[string]string{"team": "platform"}}}
+		if _, err := client.CoreV1().PersistentVolumeClaims("shop").Update(context.Background(), relabelled, metav1.UpdateOptions{}); err != nil {
+			t.Fatal(err)
+		}
+		if got := labelsOnPoll(t, m); !reflect.DeepEqual(got, core) {
+			t.Errorf("claim labels within the refresh = %v, want the cached %v", got, core)
+		}
+		pastTheRefresh(m)
+		if got := labelsOnPoll(t, m); !reflect.DeepEqual(got, map[string]string{"team": "platform"}) {
+			t.Errorf("claim labels past the refresh = %v, want the relabelled team platform", got)
+		}
+		if n := claimLists(client); n != 2 {
+			t.Errorf("claims listed %d times, want once at the start and once past the refresh", n)
+		}
+	})
+
+	t.Run("refused after a success", func(t *testing.T) {
+		refused.Store(0)
+		obs, logs := observer.New(zap.WarnLevel)
+		m, client := startMetadataLogging(t, cfg, zap.New(obs), nil, objects()...)
+		if got := labelsOnPoll(t, m); !reflect.DeepEqual(got, core) {
+			t.Fatalf("first poll claim labels = %v, want %v", got, core)
+		}
+		refuse(client)
+		pastTheRefresh(m)
+		if got := labelsOnPoll(t, m); !reflect.DeepEqual(got, core) {
+			t.Errorf("claim labels after a refused list = %v, want the previous %v", got, core)
+		}
+		if refused.Load() != 1 {
+			t.Errorf("%d refused claim lists, want the poll past the refresh to list once", refused.Load())
+		}
+		if n := logs.FilterMessageSnippet(keeping).Len(); n != 1 {
+			t.Errorf("%d warnings saying %q, want one: %v", n, keeping, logs.All())
+		}
+	})
+
+	t.Run("refused before any success", func(t *testing.T) {
+		refused.Store(0)
+		m, _ := startMetadataWith(t, cfg, refuse, objects()...)
+		if got := labelsOnPoll(t, m); got != nil {
+			t.Errorf("claim labels = %v with every claim list refused, want none", got)
+		}
+		if got := labelsOnPoll(t, m); got != nil {
+			t.Errorf("claim labels on the second poll = %v, want none", got)
+		}
+		if refused.Load() != 2 {
+			t.Errorf("%d claim lists in two polls, want each poll to list again while none succeeded", refused.Load())
+		}
+	})
+}
+
 func TestMetadata_StorageForbidden_StillReportsNodesAndPods(t *testing.T) {
 	var lists atomic.Int32
 	forbid := func(client *fake.Clientset) {
